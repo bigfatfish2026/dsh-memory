@@ -4,8 +4,8 @@
  * 状态归属：轮级可变状态 inFlight / roundSnapshot /
  * mergeBatchCache / stageLogged 归 SlotScheduler，env 上不留副本；子模块不许各持一份。
  */
-import { spawn } from 'node:child_process';
 import { createBatchPlanner } from '../batch-planner.js';
+import { runNotify } from '../shared/notify.js';
 import { batchMaxCos } from '../cluster.js';
 import {
   estimateTokens, promptBudgetOf, itemTokensOf, logWindowOnce,
@@ -259,11 +259,8 @@ export function createSleepEnv(ctx: SleepCtx, store: SleepStore, cfg: SleepCfg):
   }
 
   function push(msg: string): void {
-    try {
-      spawn(cfg.notifyScript, [msg], { detached: true, stdio: 'ignore' }).unref();
-    } catch {
-      /* 推送失败可忽略 */
-    }
+    // 2026-11-16：睡觉链这处同一个洞（同步 try 抓不到异步 ENOENT），一起收给 runNotify。
+    runNotify({ script: cfg.notifyScript, args: [msg], label: 'sleep', log: (line) => log(cfg, line) });
   }
 
   /**

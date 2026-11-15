@@ -44,6 +44,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import * as paths from './shared/paths.js';
+import { runNotify } from './shared/notify.js';
 
 /** 事件 topic：必须带点，裸名 dsh-events 直接 EV-001。 */
 export const PRESSURE_TOPIC = 'memory.context.pressure';
@@ -481,15 +482,8 @@ export function setupContextWatch(ctx: ContextWatchCtx, cfg: Record<string, unkn
 
   async function notify(message: string): Promise<void> {
     if (!cfg.contextWatchNotify) return;
-    try {
-      const { spawn } = await import('node:child_process');
-      spawn(String(cfg.notifyScript || paths.notifyScript()), [message], {
-        detached: true,
-        stdio: 'ignore',
-      }).unref();
-    } catch {
-      /* 推送失败可忽略 */
-    }
+    // 2026-11-16：spawn 收给 runNotify，ENOENT 由它挂 error 监听记 warn，不再带崩宿主。
+    runNotify({ script: String(cfg.notifyScript || paths.notifyScript()), args: [message], label: 'context-watch', log });
   }
 
   async function check(options: CheckOptions): Promise<void> {

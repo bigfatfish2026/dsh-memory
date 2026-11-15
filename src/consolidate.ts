@@ -24,6 +24,7 @@ import { enqueueSplitItem } from './split-queue.js';
 import { SELF_CONTAINED_RULES } from './lint-prompt.js';
 import { READ_ROOT, TEXT_EXT, safePath, collectFiles, clip } from './shared/read-tools.js';
 import { ensureDirFor } from './shared/fs.js';
+import { runNotify } from './shared/notify.js';
 
 /** 整理 prompt 外壳（任务说明 + JSON 格式 + 工具话术）的 token 估算，算预算时先扣掉。 */
 const CONSOLIDATE_PROMPT_SHELL_TOKENS = 1200;
@@ -1049,14 +1050,10 @@ export function setupConsolidate(ctx: ConsolidateCtx, store: ConsolidateStore, c
         const sid = String(options?.sessionId || '');
         const scope = qqScopeOf(ctx, sid);
         if (scope === 'c2c') {
-          try {
-            const { spawn } = await import('node:child_process');
-            // 2026-11-14：推送里带上会话短 id，不然「新增 N 条」对不上是哪摊活的
-            const msg = `🧠 压缩前整理记忆（${key === '(no-session)' ? '无会话' : key.slice(0, 16)}）：新增 ${saved.length} 条\n${saved.slice(0, 5).map((s) => `· ${s.slice(0, 40)}`).join('\n')}`;
-            spawn(cfg.notifyScript as string, [msg], { detached: true, stdio: 'ignore' }).unref();
-          } catch {
-            /* 推送失败可忽略 */
-          }
+          // 2026-11-14：推送里带上会话短 id，不然「新增 N 条」对不上是哪摊活的
+          const msg = `🧠 压缩前整理记忆（${key === '(no-session)' ? '无会话' : key.slice(0, 16)}）：新增 ${saved.length} 条\n${saved.slice(0, 5).map((s) => `· ${s.slice(0, 40)}`).join('\n')}`;
+          // 2026-11-16：spawn 收给 runNotify，ENOENT/EACCES 由它挂 error 监听记 warn，不再带崩宿主。
+          runNotify({ script: cfg.notifyScript as string, args: [msg], label: 'consolidate', log: (line) => log(cfg, line, key) });
         } else if (scope === 'group') {
           log(cfg, `群会话，整理新增 ${saved.length} 条，不推 QQ（只记日志）`, key);
         } else if (!sid) {
