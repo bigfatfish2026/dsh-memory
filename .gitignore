@@ -1,0 +1,12 @@
+node_modules/
+lib/
+*.log
+.DS_Store
+package-lock.json
+*.db
+*.db-*
+*.sqlite*
+state/
+logs/
+.env
+data/entity-lexicon.json

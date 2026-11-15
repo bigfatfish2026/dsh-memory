@@ -1,0 +1,39 @@
+{
+  "_note": "这是示例名录：account 只收带平台特征的名字（邮箱、@ 后缀、纯数字 ID、带站点后缀）；跟人名同形的仍归 person。实际名录由使用者自行维护，文件名 data/entity-lexicon.json（已 gitignore，可用 DSH_MEMORY_LEXICON 指定别的路径）。",
+  "version": 1,
+  "updated": "2026-11-15",
+  "person": [
+    {
+      "name": "张三",
+      "aliases": [
+        "示例人物"
+      ],
+      "etype": "person",
+      "note": "虚构的示例人物，名字和别名都可以照自己的名录替换"
+    }
+  ],
+  "account": [
+    {
+      "name": "example",
+      "aliases": [
+        "example@example.com"
+      ],
+      "etype": "account",
+      "note": "虚构的示例账号",
+      "platform": "email"
+    }
+  ],
+  "org": [
+    {
+      "name": "示例站点",
+      "aliases": [
+        "example.com"
+      ],
+      "etype": "org",
+      "note": "虚构的示例站点/组织"
+    }
+  ],
+  "repo": [],
+  "service": [],
+  "project": []
+}

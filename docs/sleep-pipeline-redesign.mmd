@@ -1,0 +1,84 @@
+sequenceDiagram
+    autonumber
+    participant T as 定时器
+    participant SP as SleepPass
+    participant IG as 会话索引 ingest_files
+    participant LN as 代码 lint text-lint.js
+    participant RV as 复核Agent lint-review.js
+    participant MA as 合并Agent
+    participant WG as 写闸 WriteGate
+    participant SA as 拆分Agent
+    participant DA as 去重Agent pending_ops
+    participant ST as Store memory.db 事务
+    participant VX as 向量索引 memvec
+
+    T->>SP: 触发本轮 sleepPass
+    Note over SP,DA: 每轮开头先重放 pending_ops
+    SP->>DA: 捞 status=pending 且 next_try_at 到期
+    DA->>ST: 重放前再查一次 dedupe
+    alt 命中 DUPLICATE
+        DA->>ST: 写 discards 并标 done
+    else 可安全重放
+        DA->>ST: 单事务写库并标 done
+    end
+
+    SP->>IG: 枚举 session 文件 不设 20 上限
+    Note over SP,IG: 首次 bootstrap 旧文件置 legacy_acked 不重读 需要时 --backfill
+    IG-->>SP: 返回待处理清单 本轮预算 20
+    loop 每个待处理文件
+        SP->>SP: 读文件并抽取候选
+        SP->>LN: 候选正文过代码 lint 只打标记
+        alt 有可疑条目
+            SP->>RV: 整批一次复核 原文 加 violations 加规则说明
+            RV-->>SP: decisions keep 或 redo 加理由
+            Note over SP,RV: keep 原样放行带 __lintReview 落库；redo 退回原 agent 重做一次，重做后仍不过落 discards；重做永不循环
+        end
+        SP->>WG: 候选逐条送唯一闸
+        alt 正文超过 200 字
+            WG->>SA: 置 needsSplit 原文不截断
+            SA-->>WG: 返回 parts 每段不超过 200 字且带 evidence
+            Note over WG,SA: 拆分失败落 pending_ops kind=split_item 原条不动
+        end
+        loop 每条候选或每个拆分段落
+            WG->>DA: 送 knn top10 加 hash 加 related 候选
+            DA-->>WG: 返回 verdict
+            Note over DA: 裁决失败落 pending_ops 不降级为 DISTINCT
+            alt verdict 为 DUPLICATE
+                WG->>ST: 写 discards 候选不入库
+            else verdict 为 SUPERSEDES
+                WG->>ST: 单事务写新条 归档旧条 写 supersedes
+                ST->>VX: 同事务写向量
+            else verdict 为 DISTINCT
+                WG->>ST: 单事务写正文与向量
+                ST->>VX: 同事务写向量
+            end
+        end
+        alt 整文件候选全部落定
+            SP->>IG: 推进 last_acked_ts 到末事件 置 done
+        else 有可重试失败
+            SP->>IG: 置 failed 且不推进 ack
+            SP->>DA: 落 pending_ops kind=ingest_file 带退避
+        end
+    end
+
+    SP->>MA: 送一批 ids 正文 relatedEntries
+    MA->>LN: ops 正文过代码 lint
+    alt 有可疑 op
+        MA->>RV: 整批一次复核
+        RV-->>MA: decisions keep 或 redo 加理由
+        Note over MA,RV: keep 的 op 原样带回 写库时带 __lintReview 放行；redo 带两轮 violations 重出这一批只一次，仍不过落 discards(LINT_REJECT)
+    end
+    MA-->>SP: 返回 ops 数组 带 evidence 与 needsSplit
+    alt 模型返回空动作
+        SP->>DA: 落 pending_ops kind=merge_batch 计 attempts
+        Note over SP,DA: 3 次仍空转 dead 写 WARN 保留行 人工 --retry-dead
+    else parseActions 全失败
+        SP->>DA: 同样落 pending_ops 计 attempts 带 raw 尾部
+        Note over SP,DA: 3 次仍失败同样转 dead 写 WARN
+    else ops 可执行
+        SP->>WG: merge update archive 逐条过闸
+        WG->>ST: 单事务 saveMemory 加旧条 update 加 archive
+        ST->>VX: 同事务写向量
+    end
+
+    Note over SP,IG: lastSleepAt 只表示上一轮成功时刻 不再是唯一真相

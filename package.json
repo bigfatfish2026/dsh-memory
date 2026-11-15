@@ -1,0 +1,56 @@
+{
+  "name": "dsh-memory",
+  "version": "1.0.0",
+  "packageManager": "pnpm@12.15.0",
+  "description": "DSH 长期记忆：四类记忆（world/experience/opinion/observation）+ 四路检索融合 + 压缩前整理 + 夜间睡觉",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "files": [
+    "lib/**/*",
+    "cordis.patch.yml",
+    "README.md",
+    "data/entity-lexicon.example.json"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "memory",
+    "bge",
+    "embedding"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-tools": "^0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "sqlite-vec-linux-arm64": "^0.1.9"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc --noEmit && tsdown",
+    "prepare": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/",
+    "pretest": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.3"
+  },
+  "author": "bigfatfish2026",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigfatfish2026/dsh-memory.git"
+  }
+}
