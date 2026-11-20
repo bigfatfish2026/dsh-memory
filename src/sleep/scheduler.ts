@@ -35,6 +35,12 @@ export interface SchedulerEnv {
   };
 }
 
+/** state 写失败时的短错误文本：日志一行能读，别把整个 stack 塞进去。 */
+function shortStateErr(error: unknown): string {
+  const msg = (error as Error | null)?.message || String(error);
+  return msg.replace(/\s+/g, ' ').slice(0, 200);
+}
+
 /** 睡觉结果的宽面：真正字段由 passes 产出，这里只取调度要用的几项。 */
 interface SleepRunResult {
   skipped?: unknown;
@@ -141,17 +147,21 @@ export class SlotScheduler {
     // 跨 HMR 的并发闸：inFlight 是实例里的，重载就丢；runningAt+heartbeatAt+owner 落 state，重载后新实例也看得见。
     try {
       stateStore.patch({ runningAt: startedAt, heartbeatAt: startedAt, owner });
-    } catch {
-      /* 写不进状态也要跑，别让状态文件拖住整理 */
+    } catch (error) {
+      // 写不进状态也要跑，但必须留痕：state 写失败是「下一拍会重跑同一档」的前兆。
+      log(`[sleep] WARN 写 state 失败（runningAt）：${shortStateErr(error)}；本轮照跑`);
     }
     // 定时心跳：单批调用再久也不会超过 3 个间隔没心跳
+    let beatFailures = 0;
     const beatTimer = setInterval(() => {
       try {
         const fresh = stateStore.load();
         if (Number(fresh.runningAt) !== startedAt) return;
         stateStore.patch({ heartbeatAt: Date.now(), owner });
-      } catch {
-        /* 下一次再试 */
+      } catch (error) {
+        // 每 60 秒一次，坏盘时会刷屏：只打第一次，后面的等收尾再算。
+        beatFailures += 1;
+        if (beatFailures === 1) log(`[sleep] WARN 写 state 失败（心跳）：${shortStateErr(error)}`);
       }
     }, SLEEP_HEARTBEAT_MS);
     if (typeof beatTimer.unref === 'function') beatTimer.unref();
@@ -167,8 +177,9 @@ export class SlotScheduler {
           delete out.owner;
           return out;
         });
-      } catch {
-        /* 清不掉就等心跳过期（3 个间隔） */
+      } catch (error) {
+        // 清不掉就等心跳过期（3 个间隔），但要留一行，别让「轮还在跑」变成幽灵锁。
+        log(`[sleep] WARN 写 state 失败（清 runningAt）：${shortStateErr(error)}`);
       }
     };
     const markSlot = () => {
@@ -189,7 +200,13 @@ export class SlotScheduler {
           if (!slots[k]) slots[k] = Date.now();
         }
       }
-      stateStore.patch({ slots, lastSleepAt: Date.now(), lastSleepDay: today });
+      const at = Date.now();
+      const written = stateStore.patch({ slots, lastSleepAt: at, lastSleepDay: today });
+      // 落地就打：这一行是「state 真的写进去了」的唯一凭据（核对 state 时先 grep 它）。
+      log(
+        `[sleep] slot 已标记 ${slotKey} slots=${Object.keys(written.slots || {}).sort().join(',')} ` +
+          `lastSleepAt=${written.lastSleepAt} state=${stateStore.file || '(内存态)'}`,
+      );
     };
     try {
       const result = await this.#env.passes.sleepPass({}) as SleepRunResult;

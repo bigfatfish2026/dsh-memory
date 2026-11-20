@@ -40,7 +40,7 @@
     "build": "tsc --noEmit && tsdown",
     "prepare": "tsdown",
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/",
+    "test": "sh -c 'b=$(mktemp -d /tmp/dsh-memory-test-XXXXXX) || exit 1; trap \"rm -rf \\\"$b\\\"\" EXIT INT TERM; TMPDIR=\"$b\" node --test test/; exit $?'",
     "pretest": "npm run build"
   },
   "devDependencies": {

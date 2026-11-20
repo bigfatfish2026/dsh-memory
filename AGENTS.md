@@ -88,3 +88,12 @@ grep -n "attempts+1\|attempts=5\|dead" "$DSH_MEMORY_LOG_DIR/memory_sleep.log" | 
 ```
 
 改完在报告里写清：改了哪个文件、留了哪条可 grep 的文案、期望看到什么。
+
+## state 文件跟 cwd 走，不跟 storePath 走
+
+`sleep.state.json` / `backup/` / `logs/` 的默认路径来自 `paths.memoryRoot()` / `paths.logDir()`，
+也就是 `process.cwd()`（这台机器 unit 的 WorkingDirectory 是 /home/julia，所以落在 /home/julia/memory 和 /home/julia/logs）；
+`memory.db` 来自 `storePath`（这台机器上是绝对路径 /home/julia/fatfish/memory）。
+核对「这轮到底写没写 state」先 grep 日志里 `[sleep] state 文件=` 那行拿准路径，再看
+`[sleep] slot 已标记` 和 `[sleep] state 落地` 两行；别去库目录里同名的那份旧 state 上翻——
+2026-11-16 05:00 那轮跑完被误判成「没写 state」，就是翻到了 /home/julia/fatfish/memory 里的旧文件。

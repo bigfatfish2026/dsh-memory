@@ -2,6 +2,7 @@
  * 睡觉链装配：先建唯一上下文，再按依赖顺序装各段，最后挂钩子/工具。
  */
 import fs from 'node:fs';
+import path from 'node:path';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import { assertMayWrite } from '../write-guard.js';
 import { attachServiceWatch, createSleepDriver, probeService } from '../sleep-schedule.js';
@@ -60,6 +61,20 @@ export function setupSleep(ctx: SetupCtx, store: SleepStore, cfg: SleepCfg): Rec
   // 价档判据接 dsh-price-clock：必须在最前面同步接上，sleepDriver.start() 会立即补判一次。
   if (cfg.sleepPriceProbe !== false) attachPriceProbe(cfg, cfg.priceClockFile);
   const env = createSleepEnv(ctx, store, cfg) as SleepEnv;
+  // state 文件路径必须打出来：它跟着 cwd 走（paths.memoryFile → cwd/memory），
+  // 而库路径来自 storePath（这台机器上是绝对路径）。两者分家时，核对的人会去翻库里那份旧
+  // state——2026-11-16 05:00 那轮跑完被误判成「没写 state」就是这个原因。落地就打。
+  try {
+    const stateFile = String(cfg.stateFile || '');
+    const stateDir = stateFile ? path.dirname(path.resolve(stateFile)) : '';
+    const storeDir = cfg.storePath ? path.resolve(String(cfg.storePath)) : '';
+    log(cfg, `[sleep] state 文件=${stateFile || '(未配)'} cwd=${process.cwd()}`);
+    if (stateDir && storeDir && stateDir !== storeDir) {
+      log(cfg, `[sleep] WARN state 目录 ${stateDir} 与库目录 ${storeDir} 不一致：核对 state 只认上面那行的路径`);
+    }
+  } catch {
+    /* 日志打不出来不影响整理 */
+  }
   // 调度器先建：轮级状态（inFlight/roundSnapshot/mergeBatchCache）归它，
   // 各段构造时捕获的是转发函数，真正调用发生在 passes 挂好之后。
   // 各段按依赖顺序装到同一个 env 上；构造发生在段挂齐之前，所以这里 env 的类型是最终形状 SleepEnv。

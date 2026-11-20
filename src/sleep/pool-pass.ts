@@ -341,12 +341,23 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
     const changed = total.added.length + total.merged.length + total.updated.length + total.archived.length;
     const ms = Date.now() - started;
     if (!dryRun && changed > 0) {
-      stateStore.patch({
-        lastSleepAt: Date.now(),
+      const at = Date.now();
+      const written = stateStore.patch({
+        lastSleepAt: at,
         lastSleepDay: dayKey(new Date()),
-        lastRunAt: Date.now(),
+        lastRunAt: at,
         lastSummary: { changed, ms, at: new Date().toISOString() },
       });
+      // 落地就打：slot 标记在 scheduler.markSlot，这里是 lastSleepAt/lastSummary，
+      // 核对「这轮到底写没写 state」时按这两行 grep，别去猜文件。
+      log(
+        cfg,
+        `[sleep] state 落地 lastSleepAt=${written.lastSleepAt} lastSummary=changed${changed}/${ms}ms ` +
+          `state=${stateStore.file || '(内存态)'}`,
+      );
+    } else if (!dryRun) {
+      // 没变就不动 lastSleepAt（它是入库水位）：说清楚是「故意不写」，不是没写。
+      log(cfg, '[sleep] state 未动（本轮 0 条变更，lastSleepAt 水位不推进）');
     }
     const discardsAdded = Math.max(0, discardCountOf(db) - discardsBefore);
     const org = {
