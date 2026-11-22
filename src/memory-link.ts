@@ -71,6 +71,35 @@ export function hasMemoryLinkTable(db: DatabaseSync | null | undefined): boolean
   }
 }
 
+/**
+ * 自动观察的「待复核」状态：默认召回剔除，只留给复核链路与 next-ticket 的可见性判定。
+ * 初态从 2026-11-21 起是 active（证据在写事务里已校验），pending_review 只表示证据后来变了。
+ */
+export const OBSERVATION_PENDING_REVIEW_STATUS = 'pending_review';
+/** 复核归档的 reason 前缀：archived + 此后缀也算「证据失效、待复核」，不进默认召回。 */
+export const OBSERVATION_ARCHIVED_REASON_PREFIX = 'evidence-';
+
+/**
+ * 默认召回要剔除的观察：只针对「自动观察」。
+ *
+ * 判据严格照 extra.autoObservation === true：手工写的 observation 没有这个标记，
+ * 一条都不受影响，仍按原来的「非 active 只留 0.3 权重影子」处理。
+ * 自动观察里两种状态算隐藏：
+ *   - pending_review：证据变了、等待复核，结论暂时不可信；
+ *   - archived 且 reason 以 'evidence-' 开头：复核判证据不再支持，正文仍留作历史。
+ *
+ * 放在 memory-link 而不是 observation-records：本文件不依赖 store 层任何模块，
+ * entities / search 两处调用方都不会和 observation-records 形成循环导入。
+ */
+export function isHiddenObservation(
+  m: { status?: unknown; reason?: unknown; autoObservation?: unknown } | null | undefined,
+): boolean {
+  if (!m || m.autoObservation !== true) return false;
+  const status = String(m.status || 'active').toLowerCase();
+  if (status === OBSERVATION_PENDING_REVIEW_STATUS) return true;
+  return status === 'archived' && String(m.reason || '').startsWith(OBSERVATION_ARCHIVED_REASON_PREFIX);
+}
+
 /** 目标记忆还活着吗：缺行、archived、merged、deleted 都算不活。 */
 function targetIsActive(db: DatabaseSync, id: string): boolean {
   try {
@@ -80,6 +109,41 @@ function targetIsActive(db: DatabaseSync, id: string): boolean {
     return status === 'active';
   } catch {
     return false;
+  }
+}
+
+/** deleteSupersedesLink 的入参：src/dst 必填，origin 不传就不限来源。 */
+export interface SupersedesLinkDeleteOptions {
+  src?: string;
+  dst?: string;
+  origin?: string;
+}
+
+/**
+ * 删一条取代边（writeSupersedesLink 的回滚口，2026-11-20）。
+ *
+ * 为什么删也要走这里：拆分归档失败时要撤掉刚写的 curate 边，那条 DELETE 必须跟写入口同一个
+ * 表、同一个口径（rel='supersedes'），不然以后改列名/加软删就漏一处。
+ * origin 给了就只删该来源的边——拆分的回滚只许删自己写的 curate，别碰 queue 判出来的边。
+ *
+ * @returns {number} 真删掉的行数（0 = 没边、没表、被 origin 过滤掉）
+ */
+export function deleteSupersedesLink(db: DatabaseSync | null | undefined, {
+  src, dst, origin = '',
+}: SupersedesLinkDeleteOptions = {}): number {
+  const from = String(src || '').trim();
+  const to = String(dst || '').trim();
+  if (!db || !from || !to) return 0;
+  if (!hasMemoryLinkTable(db)) return 0;
+  const who = String(origin || '').trim();
+  try {
+    const sql = who
+      ? "DELETE FROM memory_link WHERE src=? AND dst=? AND rel='supersedes' AND origin=?"
+      : "DELETE FROM memory_link WHERE src=? AND dst=? AND rel='supersedes'";
+    const args = who ? [from, to, who] : [from, to];
+    return Number(db.prepare(sql).run(...args).changes) || 0;
+  } catch {
+    return 0;
   }
 }
 

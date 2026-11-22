@@ -8,6 +8,7 @@
 import { insertMemoryEntity } from '../entity-gate.js';
 import { keyLog } from '../file-log.js';
 import type { KeyLogConfig } from '../file-log.js';
+import { isHiddenObservation } from '../memory-link.js';
 import { clamp01, dateOnly, normalizeType } from './types.js';
 import { isActive } from './rows.js';
 import { logStore } from './log.js';
@@ -51,7 +52,11 @@ export function entityMatches(m: MemoryRecord, name: unknown): boolean {
 
 /** 按实体聚合：观察网络（S）的本机简化版，不生成摘要，只把相关的 W/B/O 摆齐 */
 export function entityView(state: StoreState, name: unknown, limit: number = 8): EntityView {
-  const pool = state.metas.filter((m) => isActive(m) && entityMatches(m, name));
+  // 计数与列表同一口径：隐藏的自动观察（待复核 / evidence- 归档）不计数也不列出；
+  // 手工 observation 没有 autoObservation 标记，isHiddenObservation 为假，行为不变。
+  const pool = state.metas.filter(
+    (m) => isActive(m) && !isHiddenObservation(m) && entityMatches(m, name),
+  );
   const byType: Record<string, MemoryRecord[]> = { world: [], experience: [], opinion: [], observation: [] };
   for (const m of pool) {
     const type = normalizeType(m.type, m.tags, m.text);

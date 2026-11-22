@@ -6,6 +6,8 @@
  */
 import { brief, logRecall } from './log.js';
 import { isActive } from './rows.js';
+import { isPendingSplit } from './split-group.js';
+import { isHiddenObservation } from '../memory-link.js';
 import { clamp01, dateOnly, normalizeType } from './types.js';
 import type { DfCache, MemoryRecord, StoreState } from './types.js';
 
@@ -51,6 +53,8 @@ export interface HitView {
 export interface RecallOptions {
   type?: unknown;
   asOf?: unknown;
+  /** 管理视图：连 isHiddenObservation 的自动观察一起返回（默认召回剔除它们）。 */
+  includeHidden?: boolean;
   caller?: unknown;
   session?: unknown;
   origin?: unknown;
@@ -79,6 +83,8 @@ interface ScoreInput {
   tokenWeight: (t: string) => number;
   qWeightSum: number;
   semById: Map<string, number>;
+  /** 管理视图：false 时剔除 isHiddenObservation（默认召回）。 */
+  includeHidden: boolean;
 }
 
 // ── 检索用的分词与打分 ──────────────────────────────────────────────────
@@ -163,10 +169,18 @@ function semanticHits(state: StoreState, qvec: Float32Array, limit: number): Map
 }
 
 /** 逐条打分：语义余弦、关键词加权命中、实体命中、时间邻近。 */
-function scoreCandidates(state: StoreState, { query, wantType, dates, qTokens, tokenWeight, qWeightSum, semById }: ScoreInput): ScoredRow[] {
+function scoreCandidates(state: StoreState, { query, wantType, dates, qTokens, tokenWeight, qWeightSum, semById, includeHidden }: ScoreInput): ScoredRow[] {
   const rows: ScoredRow[] = [];
   for (let i = 0; i < state.metas.length; i += 1) {
+    // 候选就是 Record 本身：rows.ts 的 rowToRecord 把 extra 平铺到顶层，
+    // 所以 status 与 autoObservation 都能在这里直接读到。
     const m = state.metas[i];
+    // 默认召回剔除隐藏观察（pending_review 的自动观察 / reason=evidence-* 的归档观察）。
+    // 手工 observation 没有 autoObservation 标记，不进这个分支，仍按下面的非 active 影子处理。
+    if (!includeHidden && isHiddenObservation(m)) continue;
+    // 拆分子段的中间态硬剔除：走到 0.3 权重影子通道也等于「半截残句能被召回」，
+    // 整组激活后才算记忆（2026-11-22，partial_write 残段事故）。
+    if (!includeHidden && isPendingSplit(m)) continue;
     if (wantType && normalizeType(m.type, m.tags, m.text) !== wantType) continue;
     const cos = semById.get(m.id) ?? -1;
     const recSet = new Set(tokensForRecord(state, m));
@@ -318,7 +332,9 @@ async function recallCore(
   const qvec = Float32Array.from(qv);
   // 实体通道按查询原文匹配
   const scoreInput = {
-    query: q, wantType, dates, qTokens, tokenWeight, qWeightSum, semById: semanticHits(state, qvec, limit),
+    query: q, wantType, dates, qTokens, tokenWeight, qWeightSum,
+    semById: semanticHits(state, qvec, limit),
+    includeHidden: opts.includeHidden === true,
   };
   const rows = scoreCandidates(state, scoreInput);
   if (rows.length === 0) return [];

@@ -1,0 +1,421 @@
+/**
+ * observation 的「证据来源根」计算（2026-11-21，docs/observation-plan-v2.md）。
+ *
+ * 要解决的问题：拆分把一个原条切成 2～n 个片段后，片段各自都成了 memories 行。
+ * 「两条独立证据」如果其实是同一个原条切出来的两片，就不能算两条；合并产物与它的成员
+ * 同时出现在证据里也一样。所以计数不能按 memories.id 数，要按「来源根」数。
+ *
+ * 真库口径（行号见 src/pipeline-split.ts 与本票报告）：
+ *   - 片段 source = `sleep:split:<父id>`（父是 memories.id）或 `sleep:split:queue:<dedupeKey>`；
+ *   - 拆分不写 memories.supersedes，但 live 边会写 memory_link(src=子段, dst=父条,
+ *     rel='supersedes', origin='curate')；历史回填脚本还写过 rel='split_of'（同为子段→父条）；
+ *   - 合并新条 source='sleep:merge'，成员清单落在新条自己的 memories.supersedes 列，
+ *     extra.sources 目前**没有**写（src/store/records.ts mergeMemories / buildNewRecord），
+ *     memory_link 也没有合并边——只有历史回填脚本写过 rel='merged_into'。
+ *     所以这里三种线索都认：extra.sources/extra.sourceRoots（方案约定字段）、
+ *     merged_from/merged_into 边、sleep:merge 行的 supersedes 列。
+ *
+ * 纯函数：入参只有记忆行与边列表，不碰 store 实例、不查库、不调模型，可直接单测。
+ */
+
+import { foldForMatch, normalizeEntity } from '../shared/entity-normalize.js';
+import { entityKeysOf } from '../store/observe-notify.js';
+import { isActive } from '../store/rows.js';
+import { entityList, normalizeType } from '../store/types.js';
+import type { MemoryRecord } from '../store/types.js';
+
+/** 片段来源前缀：`sleep:split:<父id>` / `sleep:split:queue:<dedupeKey>`（pipeline-split.ts partSourceOf）。 */
+export const SPLIT_SOURCE_PREFIX = 'sleep:split:';
+/** 队列键来源里的二级前缀；根写成 `queue:<dedupeKey>`。 */
+export const SPLIT_QUEUE_PREFIX = 'queue:';
+/** 合并产物的 source 前缀（src/store/records.ts mergeMemories 写死 'sleep:merge'）。 */
+export const MERGE_SOURCE_PREFIX = 'sleep:merge';
+/** 合并血缘落过的边：merged_from（产物→成员）/ merged_into（历史回填：成员→…）。 */
+export const MERGE_RELS = ['merged_from', 'merged_into'] as const;
+/** 拆分/取代边：都是 src=子段、dst=父条。 */
+export const PARENT_RELS = ['supersedes', 'split_of'] as const;
+/** extra 里约定的成员来源字段名（merge 产物带成员清单时用）。 */
+export const MEMBER_SOURCE_KEYS = ['sources', 'sourceRoots'] as const;
+
+/** memory_link 的最小面：只读 src/dst/rel，其它列不参与判断。 */
+export interface EvidenceLink {
+  src: string;
+  dst: string;
+  rel?: string;
+}
+
+/** 一条证据的来源根：roots 去重排序；uncertain 表示来历不明，只能单独算。 */
+export interface SourceRoots {
+  roots: string[];
+  uncertain: boolean;
+}
+
+/** 独立来源计数结果：uncertain 的条目不计入 count，单列给调用方判断。 */
+export interface IndependentSourceCount {
+  count: number;
+  roots: string[];
+  uncertainIds: string[];
+  uncertainCount: number;
+}
+
+/** selectEntityEvidence 的可选项。 */
+export interface SelectEntityEvidenceOptions {
+  /** 原始实体名（display/别名都行）；匹配口径见本文件 matchesEntity（归一化键 + 词边界）。 */
+  entityKey?: string;
+  /** 已归一化的实体键（normalizeEntity().norm）；不给就用 entityKey 现算。 */
+  entityNorm?: string;
+  /** 最多几条，默认 30。 */
+  limit?: number;
+  /** 完整边表；给了就按它算根，不给只按记忆行自身的线索算。 */
+  links?: Iterable<EvidenceLink>;
+  /** 已算好的根表；给了就复用，不再自己算。 */
+  rootsMap?: ReadonlyMap<string, SourceRoots>;
+}
+
+/** selectEntityEvidence 命中的一条。 */
+export interface EntityEvidenceHit {
+  id: string;
+  record: MemoryRecord;
+  roots: string[];
+  uncertain: boolean;
+}
+
+/** selectEntityEvidence 的返回：items 是截断后的，total 是截断前的命中数。 */
+export interface EntityEvidenceSelection {
+  entityKey: string;
+  entityNorm: string;
+  total: number;
+  items: EntityEvidenceHit[];
+}
+
+/** 拆分来源解析结果。 */
+type SplitSource = { kind: 'parent'; id: string } | { kind: 'queue'; key: string };
+
+/** 解析 source 里的拆分层级；不是拆分来源（或只有空标记）返回 null。 */
+function splitSourceOf(source: unknown): SplitSource | null {
+  const tag = String(source ?? '').trim();
+  if (!tag.startsWith(SPLIT_SOURCE_PREFIX)) return null;
+  const rest = tag.slice(SPLIT_SOURCE_PREFIX.length).trim();
+  if (!rest) return null;
+  if (rest.startsWith(SPLIT_QUEUE_PREFIX)) {
+    const key = rest.slice(SPLIT_QUEUE_PREFIX.length).trim();
+    return key ? { kind: 'queue', key } : null;
+  }
+  // 历史脏数据 `sleep:split:split:<hex>` 也照父 id 处理：回查不到父条就把它当根，
+  // 同一来源的两片仍然落在同一个根上（不会各算一条）。
+  return { kind: 'parent', id: rest };
+}
+
+function isMergeSource(source: unknown): boolean {
+  return String(source ?? '').trim().startsWith(MERGE_SOURCE_PREFIX);
+}
+
+function relOf(link: EvidenceLink): string {
+  return String(link.rel ?? '').trim().toLowerCase();
+}
+
+function stringArrayOf(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item ?? '').trim()).filter(Boolean);
+}
+
+function sortRoots(values: Iterable<string>): string[] {
+  return [...new Set([...values].map((v) => String(v).trim()).filter(Boolean))].sort();
+}
+
+/** 内部解析结果：cycle 只用于在递归里传播「环上的来历不明」，不暴露给调用方。 */
+interface Resolution extends SourceRoots {
+  cycle?: boolean;
+}
+
+interface ResolveContext {
+  byId: Map<string, MemoryRecord>;
+  linksFrom: Map<string, EvidenceLink[]>;
+  linksInto: Map<string, EvidenceLink[]>;
+  memo: Map<string, Resolution>;
+}
+
+/**
+ * 一条记录自己声明的成员来源（合并产物）。
+ *
+ * 两个来源都看：
+ *   - `record.extra.sources` / `record.extra.sourceRoots`（方案约定字段）；
+ *   - 顶层 `record.sources` / `record.sourceRoots`——rows.ts 的 rowToRecord 会把 extra
+ *     的键摊平回记录顶层（extra 不是记录里的普通字段），只查 extra 会漏掉真库读出来的行。
+ */
+function declaredMemberSources(record: MemoryRecord): string[] {
+  const extra = record.extra && typeof record.extra === 'object' && !Array.isArray(record.extra)
+    ? record.extra as Record<string, unknown>
+    : null;
+  const out: string[] = [];
+  for (const key of MEMBER_SOURCE_KEYS) {
+    out.push(...stringArrayOf(extra?.[key]));
+    out.push(...stringArrayOf(record[key]));
+  }
+  return sortRoots(out);
+}
+
+/** 递归解析一条 id 的来源根：memo 缓存 + 调用栈防环，环上的条目记 uncertain。 */
+function resolveRoots(id: string, ctx: ResolveContext, stack: Set<string>): Resolution {
+  const cached = ctx.memo.get(id);
+  if (cached) return cached;
+  // 环：A 的 source 指向 B、B 又指回 A（或自指）。不再往下追，记一条来历不明。
+  if (stack.has(id)) return { roots: [id], uncertain: true, cycle: true };
+
+  const record = ctx.byId.get(id);
+  if (!record) {
+    // 父条/成员不在入参里：它是谁已经写在 source/边里了，就把这个 id 当根。
+    const outside: Resolution = { roots: [id], uncertain: false };
+    ctx.memo.set(id, outside);
+    return outside;
+  }
+
+  stack.add(id);
+  const roots: string[] = [];
+  let hasClue = false;
+  let cycle = false;
+
+  /** 把一条线索指向的目标并进来；目标就在当前调用栈上就是环，标出来不再往下追。 */
+  const inherit = (target: string): void => {
+    const key = String(target ?? '').trim();
+    if (!key) return;
+    hasClue = true;
+    if (stack.has(key)) {
+      roots.push(key);
+      cycle = true;
+      return;
+    }
+    const sub = resolveRoots(key, ctx, stack);
+    roots.push(...sub.roots);
+    if (sub.cycle) cycle = true;
+  };
+
+  // ① 拆分来源：父是根候选，父本身也是片段就继续往上追到最顶层（防孙段算新来源）。
+  const split = splitSourceOf(record.source);
+  if (split?.kind === 'queue') {
+    roots.push(`${SPLIT_QUEUE_PREFIX}${split.key}`);
+    hasClue = true;
+  } else if (split?.kind === 'parent') {
+    inherit(split.id);
+  }
+
+  // ② 合并产物自带的成员来源：extra.sources / extra.sourceRoots（含摊平后的顶层键）。
+  //    集合里若是成员 id 而不是根 id，跟着追一层，避免「产物 + 成员」被算成两条。
+  const declared = declaredMemberSources(record);
+  for (const member of declared) inherit(member);
+
+  // ③ memory_link 的合并边：merged_from（产物→成员）与历史 merged_into 两个方向都认。
+  for (const link of ctx.linksFrom.get(id) ?? []) {
+    const rel = relOf(link);
+    if ((MERGE_RELS as readonly string[]).includes(rel)) inherit(String(link.dst ?? ''));
+  }
+  for (const link of ctx.linksInto.get(id) ?? []) {
+    const rel = relOf(link);
+    if ((MERGE_RELS as readonly string[]).includes(rel)) inherit(String(link.src ?? ''));
+  }
+
+  // ④ mergeMemories 不写 extra.sources、也不写边：成员清单只落在产物自己的 supersedes 列。
+  //    只对 source='sleep:merge*' 的行这么读，普通 update/save 的 supersedes 不当合并血缘。
+  if (!declared.length && isMergeSource(record.source)) {
+    for (const member of entityList(record.supersedes)) inherit(member);
+  }
+
+  // ⑤ 历史 live 边：src=子段、dst=父条（supersedes / split_of）。父条的根并进来。
+  for (const link of ctx.linksFrom.get(id) ?? []) {
+    const rel = relOf(link);
+    if (!(PARENT_RELS as readonly string[]).includes(rel)) continue;
+    inherit(String(link.dst ?? ''));
+  }
+
+  stack.delete(id);
+  const sourceTag = String(record.source ?? '').trim();
+  // 没有任何来源线索：自己就是根；source 也空说明来历不明，调用方不能拿它凑独立来源。
+  const out: Resolution = hasClue
+    ? { roots: sortRoots(roots), uncertain: cycle }
+    : { roots: [id], uncertain: !sourceTag };
+  if (cycle) out.cycle = true;
+  ctx.memo.set(id, out);
+  return out;
+}
+
+function indexLinks(links: Iterable<EvidenceLink>, side: 'src' | 'dst'): Map<string, EvidenceLink[]> {
+  const out = new Map<string, EvidenceLink[]>();
+  for (const link of links) {
+    const key = String(link?.[side] ?? '').trim();
+    if (!key) continue;
+    const list = out.get(key);
+    if (list) list.push(link);
+    else out.set(key, [link]);
+  }
+  return out;
+}
+
+/**
+ * 一组记忆行 + 边表 → 每条的来源根。
+ *
+ * 根的口径：
+ *   - `sleep:split:<父id>`：父条（沿 source 递归到最顶层）是根；
+ *   - `sleep:split:queue:<key>`：根是 `queue:<key>`；
+ *   - 合并产物：extra.sources / extra.sourceRoots，或 merged_from/merged_into 边，
+ *     或 sleep:merge 行的 supersedes 列；
+ *   - supersedes / split_of 边指向父条：父条的根并进来；
+ *   - 以上都没有：roots=[自身 id]；source 也空则 uncertain=true（来历不明）。
+ *
+ * @param records 记忆行（至少 id/source/supersedes/extra/status）
+ * @param links   memory_link 边（src/dst/rel）；不给就只用记忆行自身的线索
+ */
+export function sourceRootsOf(
+  records: Iterable<MemoryRecord>,
+  links: Iterable<EvidenceLink> = [],
+): Map<string, SourceRoots> {
+  const byId = new Map<string, MemoryRecord>();
+  for (const record of records) {
+    const id = String(record?.id ?? '').trim();
+    if (!id) continue;
+    byId.set(id, record);
+  }
+  const linkList = [...links];
+  const ctx: ResolveContext = {
+    byId,
+    linksFrom: indexLinks(linkList, 'src'),
+    linksInto: indexLinks(linkList, 'dst'),
+    memo: new Map(),
+  };
+  const out = new Map<string, SourceRoots>();
+  for (const id of byId.keys()) {
+    const resolved = resolveRoots(id, ctx, new Set());
+    out.set(id, { roots: resolved.roots, uncertain: resolved.uncertain });
+  }
+  return out;
+}
+
+/**
+ * 把证据 id 的来源根取并集后计数（同一原条的多片、多级拆分都只算一条）。
+ *
+ * uncertain 的条目不参与并集计数，单独列在 uncertainIds 里（调用方决定能不能凑两条）。
+ * 不在 rootsMap 里的 id 也一样按 uncertain 处理——说明拿不到它的来历，不能冒充独立来源。
+ * 空 id 忽略，重复 id 去重（rootsMap 取并集本来就幂等）。
+ */
+export function independentSourceCount(
+  ids: Iterable<unknown>,
+  rootsMap: ReadonlyMap<string, SourceRoots>,
+): IndependentSourceCount {
+  const roots = new Set<string>();
+  const uncertain = new Set<string>();
+  for (const raw of ids) {
+    const id = String(raw ?? '').trim();
+    if (!id) continue;
+    const hit = rootsMap.get(id);
+    if (!hit) {
+      uncertain.add(id);
+      continue;
+    }
+    if (hit.uncertain) {
+      uncertain.add(id);
+      continue;
+    }
+    for (const root of hit.roots) {
+      const key = String(root ?? '').trim();
+      if (key) roots.add(key);
+    }
+  }
+  return {
+    count: roots.size,
+    roots: sortRoots(roots),
+    uncertainIds: [...uncertain].sort(),
+    uncertainCount: uncertain.size,
+  };
+}
+
+/** 词内字符：归一化后只把 ASCII 字母/数字/下划线算词内；空格、标点、汉字、路径分隔符都算词边界。 */
+const WORD_CHAR = /[0-9a-z_]/;
+
+/** text[at, at+len) 两侧都不粘词内字符：'read' 不命中 'readonly'，命中 'read 的' / '-read'。 */
+function wholeWordAt(text: string, at: number, len: number): boolean {
+  const before = at > 0 ? text[at - 1] : '';
+  const after = at + len < text.length ? text[at + len] : '';
+  return !WORD_CHAR.test(before) && !WORD_CHAR.test(after);
+}
+
+/** 正文里有没有这个整词：逐个出现位置查边界，不做裸 includes。 */
+function containsWholeWord(text: string, word: string): boolean {
+  if (!text || !word) return false;
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (wholeWordAt(text, at, word.length)) return true;
+  }
+  return false;
+}
+
+/** key 以 word 开头且 word 之后正好是词边界：'anri的' 命中 'anri'，'readonly' 不命中 'read'。 */
+function startsWithWholeWord(key: string, word: string): boolean {
+  return key.startsWith(word) && !WORD_CHAR.test(key.slice(word.length, word.length + 1));
+}
+
+/**
+ * 实体匹配：只认三种，全部按规范化键 + 词边界判定，不做裸子串。
+ *
+ * 1) 记录实体键与观察键归一化后相等 —— 和 assertEvidence 的精确键交集同一口径；
+ * 2) 记录实体键以观察键为「完整词前缀」（观察键长度 ≥3，且正文里作为独立词出现）：
+ *    'Anri 的' 归一化成 'anri的'，命中 'anri'；'readonly' 不命中 'read'（'read' 后面还粘着 'o'）。
+ *    方向只从观察键往记录键看：'src/shared/notify.ts' 不会命中 'notify.ts'（记录键不以它开头）；
+ * 3) 老条目（entities 列没有可比实体键）正文整词兜底。
+ *
+ * 有实体键的行不走 3)：纯正文命中拿不到精确键交集，落库时必然被 assertEvidence 拒
+ * （logs/memory_sleep.log 2026-11-22 的 bash / echo / 任务书 等 EVIDENCE_ENTITY_MISMATCH 就是这类）。
+ */
+function matchesEntity(record: MemoryRecord, norm: string): boolean {
+  if (!norm) return false;
+  const keys = entityKeysOf(entityList(record.entities));
+  if (keys.includes(norm)) return true;
+  const text = foldForMatch(String(record.text ?? ''));
+  if (!containsWholeWord(text, norm)) return false;
+  if (norm.length >= 3 && keys.some((key) => startsWithWholeWord(key, norm))) return true;
+  return keys.length === 0 && norm.length >= 2;
+}
+
+function evidenceTimeOf(record: MemoryRecord): string {
+  return String(record.validFrom || record.ts || '');
+}
+
+/**
+ * 取某个实体下可以作为 observation 证据的条目：active 的 world/experience，按
+ * validFrom||ts 倒序（同 store/entities.ts 的 entityView 口径）取 limit 条，并带上来源根。
+ *
+ * active 口径同 rows.ts isActive：status 空/NULL 也算 active。roots 默认按入参全部记录
+ * 现算（这样父条即使不在命中集里也能追到），也可以传 rootsMap 复用已有结果。
+ */
+export function selectEntityEvidence(
+  records: Iterable<MemoryRecord>,
+  options: SelectEntityEvidenceOptions = {},
+): EntityEvidenceSelection {
+  const list = [...records];
+  const entityKey = String(options.entityKey ?? '').trim();
+  const entityNorm = normalizeEntity(
+    String(options.entityNorm ?? '').trim() || entityKey,
+  ).norm;
+  const rawLimit = Number(options.limit);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : 30;
+  const rootsMap = options.rootsMap
+    ?? sourceRootsOf(list, options.links ? [...options.links] : []);
+
+  const matched = list.filter((record) => {
+    if (!isActive(record)) return false;
+    if (!['world', 'experience'].includes(normalizeType(record.type, record.tags, record.text))) return false;
+    return matchesEntity(record, entityNorm);
+  });
+  matched.sort((a, b) => {
+    const byTime = evidenceTimeOf(b).localeCompare(evidenceTimeOf(a));
+    return byTime !== 0 ? byTime : String(a.id).localeCompare(String(b.id));
+  });
+
+  const items = matched.slice(0, limit).map((record) => {
+    const hit = rootsMap.get(record.id);
+    return {
+      id: record.id,
+      record,
+      roots: hit ? [...hit.roots] : [record.id],
+      uncertain: hit ? hit.uncertain : true,
+    };
+  });
+  return { entityKey, entityNorm, total: matched.length, items };
+}
