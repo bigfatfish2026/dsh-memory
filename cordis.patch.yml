@@ -64,6 +64,19 @@
         sleepSplitEnabled: true
         # 2026-10-29 入口冲突检查：新记忆入库前跟同实体旧条比一次（不再设条数上限）
         conflictCheckEnabled: true
+        # 2026-11-20 冲突预判：入口冲突检查先问本地 decision 桥（127.0.0.1:3427/systemone），
+        # 高置信判 new 的直接放行，省掉一次生成调用（今天实测 81.1% 判 new、p50 9.7s）。
+        # 默认关；打开前先确认桥在跑（curl -sS http://127.0.0.1:3427/healthz）。
+        # 桥失败 / 超时 / 429 / 答案缺 qid 一律整批退回原 askConflict，主流程无感知。
+        # batchSize 硬上限 10（批内共享 state 会互相污染），timeoutMs 是单批超时；
+        # 缺 qid 不算命中，整批退回。代码默认值在 src/index.ts 的 Config，这里只是本机口径。
+        conflictDecide:
+          enabled: false
+          batchSize: 8
+          minConfidence: 0.9
+          timeoutMs: 2500
+          baseUrl: http://127.0.0.1:3427
+          model: gemini-decision-1
         # 2026-10-30 决定不汇报睡醒汇总，关掉（失败仍会推）
         sleepSummaryNotify: false
         # 2026-11-05 第二步：会话入库改按文件 ack（ingest_files + pending_ops 重放）。

@@ -6,6 +6,7 @@ import { createToolLoopGuard } from '../agent-loop.js';
 import { relatedEntries } from '../related.js';
 import { collectTurnChunks, repairToolCallIds, READ_TOOLS, runReadTool } from './tool-calls.js';
 import { SYSTEM, SYSTEM_CONFLICT, SYSTEM_CLUSTER } from './prompts.js';
+import { conflictDecideCfgOf, decideNewBatch, DECIDE_BATCH_CAP } from './decision.js';
 import type { ChatMessage } from './tool-calls.js';
 import type { SleepCfg, SleepCtx, SleepStore } from './env.js';
 import type { MemoryRecord, MemoryView } from '../store/types.js';
@@ -43,6 +44,23 @@ interface ConflictCheckResult {
   stateChange: unknown[];
   conflict: unknown[];
   failed: number;
+}
+
+/** askObservation 的产物：正文 + 本轮请求数 + 字符计量（token 由 llm-usage 的 [usage] 行记）。 */
+export interface AskObservationResult {
+  text: string;
+  calls: number;
+  promptChars: number;
+  completionChars: number;
+}
+
+/** 一条待判的新增：本地筛选之后、还没问模型的那批。 */
+interface PendingConflict {
+  /** 在 adds 里的下标：结果要按下标还原顺序，不能靠 push 顺序。 */
+  index: number;
+  item: ConflictAdd;
+  text: string;
+  related: MemoryRecord[];
 }
 
 export function createModelCalls(env: ModelCallsEnv) {
@@ -216,6 +234,44 @@ async function askCluster(cluster: MemoryView[], feedback = ''): Promise<string>
 }
 
 /**
+ * 问模型：给一个实体提炼 observation（2026-11-21，docs/observation-plan-v2.md §7）。
+ *
+ * 与 askModel / askCluster 的区别：证据与观察全在 user message 里，不开只读工具——
+ * 观察只许根据「本次实际下发的那批证据 id」下结论，模型自己扩大证据面会让
+ * validateObservationOps 的 allowedEvidenceIds 失真。
+ *
+ * 流式收口走 collectTurnChunks（与上面两条同一条路）：文本按 chunk 累加，
+ * finish(reason.kind='error') 由它抛错，异常原样交给调用方按任务收口（failObserveTask）。
+ * 超时不在这里另设：与 askModel/askCluster 一致，由 provider/宿主按请求超时处理。
+ */
+async function askObservation(system: string, user: string): Promise<AskObservationResult> {
+  const sys = String(system ?? '');
+  const prompt = String(user ?? '');
+  const stream = llmOf(ctx, { site: 'sleep:askObservation', log: (line) => log(cfg, line), cfg }).stream({
+    provider: cfg.provider,
+    model: cfg.model,
+    reasoningEffort: 'low',
+    system: sys,
+    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+    // 2026-11-14 口径：不传 maxTokens，由 provider 封顶
+  });
+  const turn = await collectTurnChunks(
+    stream as AsyncIterable<import('./tool-calls.js').StreamChunk>,
+    { errorLabel: 'observation 提炼模型调用失败' },
+  );
+  const text = turn.text;
+  if (!text.trim()) {
+    log(cfg, `observation 提炼返回空文本，chunk 类型：${[...new Set(turn.seen)].join(',')}`);
+  }
+  return {
+    text,
+    calls: 1,
+    promptChars: sys.length + prompt.length,
+    completionChars: text.length,
+  };
+}
+
+/**
  * 阶段二：分簇整理。
  * 先用向量+实体把记忆聚成小批（cluster.js），再一批一次模型调用——
  * 每批只看这二三十条，重复才看得见。单条成批的直接跳过，不问模型。
@@ -260,36 +316,79 @@ async function askConflict(text: string, related: MemoryRecord[]): Promise<Confl
  * 每出一条新记忆，先按实体找同实体的旧条，问模型这是冗余、矛盾还是状态变更。
  * 状态变更就改写成演进叙事并把旧条挂进 supersedes——相似度抓不到这种，余弦太低了。
  */
+/**
+ * 批量前置判定（2026-11-20）：把待判条按 batchSize 切批送 decision 桥，
+ * 返回「判成 new 的下标」集合（相对 pending）。
+ *
+ * 开关关着 / 没有待判条 / 桥任何异常 → 空集合，调用方把这批全部退回 askConflict，
+ * 与加这层之前逐条一致。这里不抛：主流程不该感知预判层的死活。
+ */
+async function prejudgeNew(pending: PendingConflict[]): Promise<Set<number>> {
+  const hit = new Set<number>();
+  const decideCfg = conflictDecideCfgOf(cfg.conflictDecide);
+  if (!decideCfg.enabled || !pending.length) return hit;
+  try {
+    const size = Math.max(1, Math.min(decideCfg.batchSize, DECIDE_BATCH_CAP));
+    let batches = 0;
+    let degraded = 0;
+    for (let start = 0; start < pending.length; start += size) {
+      const slice = pending.slice(start, start + size);
+      const result = await decideNewBatch(
+        slice.map((p) => ({ text: p.text, related: p.related })),
+        decideCfg,
+      );
+      batches += 1;
+      degraded += result.degraded;
+      for (const i of result.decided) hit.add(start + i);
+      log(cfg, `[decide] 批 n=${slice.length} 命中=${result.decided.size} 降级=${result.degraded} 原因=${result.reason} 耗时=${result.ms}ms`);
+    }
+    log(cfg, `[decide] 汇总 批=${batches} 命中=${hit.size} 降级=${degraded} 省askConflict=${hit.size}`);
+  } catch (error) {
+    log(cfg, `[decide] 预判异常，整轮退回 askConflict：${(error as Error | null)?.message || error}`);
+    hit.clear();
+  }
+  return hit;
+}
+
 async function runConflictCheck(adds: unknown[] | null): Promise<ConflictCheckResult> {
   const out = { checked: 0, redundant: [] as unknown[], stateChange: [] as unknown[], conflict: [] as unknown[], failed: 0 };
   // 2026-11-14：一次最多检查 N 条（conflictCheckMaxCalls=20）删了，全部检查
   if (!Array.isArray(adds) || !adds.length) return { adds: adds || [], ...out };
   const active = store.listAll().filter((m) => (m.status || 'active') === 'active');
-  const kept: unknown[] = [];
-  for (const item of adds as ConflictAdd[]) {
+
+  // 第一遍只做本地筛选（实体 + 2-gram，不花模型），待判条按原下标攒起来；
+  // 结果最后按下标还原，kept 顺序与逐条走时一致。
+  const pending: PendingConflict[] = [];
+  for (let index = 0; index < adds.length; index += 1) {
+    const item = adds[index] as ConflictAdd;
     const text = String(item?.text || '').trim();
     const ents = (item?.entities || []).map((e) => String(e).trim()).filter(Boolean);
-    if (!text || !ents.length) {
-      kept.push(item);
-      continue;
-    }
+    if (!text || !ents.length) continue;
     const related = relatedEntries(text, ents, active as unknown as MemoryRecord[]);
-    if (!related.length) {
-      kept.push(item);
-      continue;
-    }
-    out.checked += 1;
+    if (!related.length) continue;
+    pending.push({ index, item, text, related });
+  }
+  out.checked = pending.length;
+
+  // 新增：批量前置判定。开关关着时 prejudgeNew 直接返回空集合，不发请求、不打日志。
+  const decidedNew = await prejudgeNew(pending);
+
+  const patched = new Map<number, unknown>();
+  const dropped = new Set<number>();
+  for (const [k, p] of pending.entries()) {
+    if (decidedNew.has(k)) continue; // 预判 new：原样入库，省掉这次 askConflict
+    const { text, related, item } = p;
     const verdict = await askConflict(text, related).catch((error) => {
       log(cfg, `入口冲突检查失败：${(error as Error | null)?.message || error}`);
       return null;
     });
     if (!verdict) {
       out.failed += 1;
-      kept.push(item);
       continue;
     }
     if (verdict.verdict === 'redundant') {
       out.redundant.push({ text: text.slice(0, 60), supersedes: verdict.supersedes });
+      dropped.add(p.index);
       continue; // 换个说法，不入库
     }
     if (verdict.verdict === 'state_change') {
@@ -301,22 +400,29 @@ async function runConflictCheck(adds: unknown[] | null): Promise<ConflictCheckRe
         next.supersedes = [...new Set([...(Array.isArray(item.supersedes) ? item.supersedes : []), ...sup])];
       }
       out.stateChange.push({ supersedes: sup, text: next.text.slice(0, 60) });
-      kept.push(next);
+      patched.set(p.index, next);
       continue;
     }
     if (verdict.verdict === 'conflict') {
       out.conflict.push({ text: text.slice(0, 60), against: verdict.supersedes });
     }
-    kept.push(item);
+  }
+
+  const kept: unknown[] = [];
+  for (let index = 0; index < adds.length; index += 1) {
+    if (dropped.has(index)) continue;
+    kept.push(patched.has(index) ? patched.get(index) : adds[index]);
   }
   if (out.checked) {
+    // 开关关着时 decidedNew 为空 → 日志文本与加预判之前逐字节一致。
+    const saved = decidedNew.size ? ` 预判省调用${decidedNew.size}` : '';
     log(
       cfg,
-      `入口检查 ${out.checked} 条：状态变更${out.stateChange.length} 冗余丢弃${out.redundant.length} 矛盾${out.conflict.length} 失败${out.failed}`,
+      `入口检查 ${out.checked} 条：状态变更${out.stateChange.length} 冗余丢弃${out.redundant.length} 矛盾${out.conflict.length} 失败${out.failed}${saved}`,
     );
   }
   return { adds: kept, ...out };
 }
 
-  return { askModel, askCluster, askConflict, runConflictCheck };
+  return { askModel, askCluster, askConflict, askObservation, runConflictCheck };
 }
