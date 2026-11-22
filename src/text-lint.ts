@@ -21,10 +21,13 @@ export const LEADING_CONJUNCTIONS = [
 /**
  * 只认「句首 / 分句首」的指代词。
  * 「它」「此」单字太容易撞词（其它、此前、此外……），分句首命中后再看后一个字是否成词。
+ * 2026-11-20 P0：补「这份文件/该目录/这个仓库/这个插件/本文件」；长词排前面，命中时取最长那个。
  */
 export const BARE_REFERENCES = [
-  '这一步', '该步', '上述', '上面', '前者', '后者', '该结论', '这个改动',
-  '那条', '该条', '它', '此',
+  '这个仓库', '这个插件', '这份文件', '这个改动', '该结论',
+  '本文件', '该目录',
+  '这一步', '上述', '上面', '前者', '后者', '该步', '那条', '该条',
+  '它', '此',
 ];
 
 /** 「此」后面紧跟这些字时是时间/方位词，不是指代，不算命中。 */
@@ -34,7 +37,9 @@ const CI_COMPOUND = new Set(['前', '后', '时', '刻', '间', '外', '中', '�
  * 「它」「此」这种单字指代只在**整条正文的第一个字**才算命中（2026-11-06 t-mw515yk8）。
  * 起因：存量误杀「用户安装了 dsh-github-mcp 插件，它是官方远程 MCP…」——
  * 同一个句子里对象已经写清了，逗号后面接个「它」读得懂，不该按分句首一视同仁地打回。
- * 「这一步」「上述」这类短语照旧按分句首判。
+ *
+ * 2026-11-20 P0 阶段一：分句首的单字指代改成**只记不拒**——命中记 `bare_reference_clause`
+ * （severity='warn'），不参与 ok；整条首个字仍是 `bare_reference`（reject）。拒绝行为留给阶段二。
  */
 const SINGLE_CHAR_REFS = new Set(['它', '此']);
 
@@ -84,6 +89,7 @@ const SHORT_COORD_RE = /\d|[\\/]|[A-Za-z][\w.-]*\.[A-Za-z0-9]{1,8}\b|\b[A-Za-z][
 const HINTS: Record<string, string> = {
   leading_conjunction: '去掉这个连接词，直接从本条真正的对象写起',
   bare_reference: '把指代词换成具体名词：哪个文件、哪个参数、哪张表、哪个服务',
+  bare_reference_clause: '分句首的单字指代（阶段二才拒绝，当前只记）：把指代词换成具体名词',
   too_short: `不足 ${MIN_CHARS} 字，补对象和结果，别只留半句结论`,
   meta_reference: '删掉元说明，只写事实本身',
   unverified_claim: '补坐标或删掉判断词',
@@ -95,6 +101,8 @@ export interface LintViolation {
   match: string;
   index: number;
   hint: string;
+  /** reject = 参与 ok 判定（默认，不写这个键）；warn = 只记不阻断（2026-11-20 P0 阶段一）。 */
+  severity?: 'warn';
 }
 
 /** 单条正文的判定结果；ok 为真时 violations 必空。 */
@@ -123,8 +131,23 @@ export interface LintBatchResult<T> {
   rejected: Array<RejectedEntry<T>>;
 }
 
-function pushViolation(list: LintViolation[], code: string, match: unknown, index: unknown, hint?: string): void {
-  list.push({ code, match: String(match), index: Math.max(0, Number(index) || 0), hint: hint || HINTS[code] || '' });
+function pushViolation(
+  list: LintViolation[],
+  code: string,
+  match: unknown,
+  index: unknown,
+  hint?: string,
+  severity?: 'warn',
+): void {
+  const violation: LintViolation = {
+    code,
+    match: String(match),
+    index: Math.max(0, Number(index) || 0),
+    hint: hint || HINTS[code] || '',
+  };
+  // 只有 warn 才写 severity，reject 的违规对象形状保持原样
+  if (severity === 'warn') violation.severity = 'warn';
+  list.push(violation);
 }
 
 /** 分句起点：正文开头，以及每个句读标点之后第一个非空白字符的绝对下标。 */
@@ -156,16 +179,23 @@ function leadingConjunctionOf(text: string): { word: string; index: number } | n
   return null;
 }
 
-function bareReferenceAt(text: string, start: number, firstCharIndex: number): string | null {
+/**
+ * 段首指代命中：返回命中的词与级别。
+ * 单字指代（它/此）在整条首字仍是 reject；分句首降为 warn（只记不拒，2026-11-20 P0 阶段一）。
+ */
+function bareReferenceAt(
+  text: string,
+  start: number,
+  firstCharIndex: number,
+): { ref: string; severity?: 'warn' } | null {
   for (const ref of BARE_REFERENCES) {
     if (!text.startsWith(ref, start)) continue;
-    // 单字指代只认整条正文的第一个字，分句首不算（2026-11-06 t-mw515yk8）
-    if (SINGLE_CHAR_REFS.has(ref) && start !== firstCharIndex) continue;
     if (ref === '此') {
       const next = text[start + 1] || '';
       if (CI_COMPOUND.has(next)) continue;
     }
-    return ref;
+    if (SINGLE_CHAR_REFS.has(ref) && start !== firstCharIndex) return { ref, severity: 'warn' };
+    return { ref };
   }
   return null;
 }
@@ -188,8 +218,13 @@ export function lintMemoryText(text: unknown): LintResult {
     return i < body.length ? i : -1;
   })();
   for (const start of clauseStarts(body)) {
-    const ref = bareReferenceAt(body, start, firstCharIndex);
-    if (ref) pushViolation(violations, 'bare_reference', ref, start);
+    const hit = bareReferenceAt(body, start, firstCharIndex);
+    if (!hit) continue;
+    if (hit.severity === 'warn') {
+      pushViolation(violations, 'bare_reference_clause', hit.ref, start, undefined, 'warn');
+      continue;
+    }
+    pushViolation(violations, 'bare_reference', hit.ref, start);
   }
 
   const dense = body.replace(/\s+/g, '');
@@ -214,7 +249,14 @@ export function lintMemoryText(text: unknown): LintResult {
   }
   CLAIM_RE.lastIndex = 0;
 
-  return { ok: violations.length === 0, violations };
+  // 只有 reject 级违规才让 ok=false；warn（阶段一信号）只记不拒
+  const blocking = violations.some((v) => v.severity !== 'warn');
+  return { ok: !blocking, violations };
+}
+
+/** 只取「只记不拒」的违规（stage-one 信号），给调用方打 INFO 日志用。 */
+export function lintWarnings(result: LintResult | null | undefined): LintViolation[] {
+  return (result?.violations || []).filter((v) => v.severity === 'warn');
 }
 
 /** 一次判一批（merge/split 一次出好几条）：逐条判，通过的照常入库。 */

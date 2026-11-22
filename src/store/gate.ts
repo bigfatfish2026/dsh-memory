@@ -6,7 +6,7 @@
  */
 import { sha1Hex } from '../fingerprint.js';
 import { recordDiscard } from '../write-gate.js';
-import { lintMemoryText, lintRejectReason } from '../text-lint.js';
+import { lintMemoryText, lintRejectReason, lintWarnings } from '../text-lint.js';
 import { dedupe } from '../agents/dedupe.js';
 import { enqueue, MAX_ATTEMPTS } from '../ingest-index.js';
 import { recordAttempt } from '../ledger.js';
@@ -79,6 +79,16 @@ export function assertTextLint(
   const { cfg } = state;
   if (cfg.pipeline?.textLint === false) return null;
   const result = lintMemoryText(text);
+  // 2026-11-20 P0 阶段一：warn 级违规（分句首单字指代等）只记不拒，留一行 INFO 可 grep；
+  // 拒绝口径不变——只有 reject 级才会让 result.ok 为 false。
+  const warns = lintWarnings(result);
+  if (warns.length) {
+    logStore(
+      cfg, 'INFO', `[lint] warn ${action}`,
+      `source=${typeof source === 'string' ? source : (source?.session || source?.id || '-')} ` +
+        `n=${warns.length} ${lintRejectReason(warns)} text40=${String(text).slice(0, 40)}`,
+    );
+  }
   if (result.ok) return null;
   // 复核判 keep（误杀）：代码标记留着，但这一条按复核裁决放行，留一条日志可追
   if (review && review.verdict === 'keep') {

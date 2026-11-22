@@ -43,9 +43,10 @@ test('bare_reference：其它/此前/句中指代都不算，不误伤', () => {
   assert.equal(has('小林把三条记忆逐条读了一遍，其它都合格。', 'bare_reference'), false);
 });
 
-test('bare_reference：它/此 单字只在整条正文第一个字算，分句首不算（2026-11-06 t-mw515yk8）', () => {
-  // 分句首的「它」不再算：同一句里对象已经写清，读得懂
+test('bare_reference：它/此 单字整条首字才判 reject，分句首只记 warn（2026-11-20 P0）', () => {
+  // 分句首不判 reject，只记 bare_reference_clause（severity=warn）：拒绝留给阶段二
   assert.equal(has('2026-11-06 小林改完闸。它把 lint 接进 store.js 第 530 行。', 'bare_reference'), false);
+  assert.equal(has('2026-11-06 小林改完闸。它把 lint 接进 store.js 第 530 行。', 'bare_reference_clause'), true);
   assert.equal(has('小林查了 store.js 的 lint 入口，其它两个写入函数也接上了。', 'bare_reference'), false);
   // 整条第一个字就是「它」/「此」→ 仍然命中
   assert.equal(has('它以 store.js 为入口，2026-11-06 接上了三个写入函数。', 'bare_reference'), true);
@@ -199,11 +200,15 @@ test('纯函数：同一输入连跑两次结果一致，不抛错', () => {
   assert.equal(lintMemoryText(undefined).ok, false);
 });
 
-test('常量表与提示词口径一致：连接词 15 个、指代词 12 个', () => {
+test('常量表与提示词口径一致：连接词 15 个、指代词 17 个', () => {
   assert.equal(LEADING_CONJUNCTIONS.length, 15);
   assert.equal(LEADING_CONJUNCTIONS.includes('但是'), true);
   assert.equal(LEADING_CONJUNCTIONS.includes('总之'), true);
-  assert.equal(BARE_REFERENCES.length, 12);
+  assert.equal(BARE_REFERENCES.length, 17);
   assert.equal(BARE_REFERENCES.includes('这一步'), true);
   assert.equal(BARE_REFERENCES.includes('此'), true);
+  // 2026-11-20 P0：补五个长词（split 段级口径同表）
+  for (const word of ['这份文件', '该目录', '这个仓库', '这个插件', '本文件']) {
+    assert.equal(BARE_REFERENCES.includes(word), true, `指代词表缺 ${word}`);
+  }
 });
