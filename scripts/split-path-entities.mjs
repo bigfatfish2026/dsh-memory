@@ -21,6 +21,10 @@
  *   5) 拆解审计落 entity_merge：src=新实体、dst=原实体、reason='fake_split'，
  *      evidence 里存 group / keys / memory_ids / review_memory_ids，--undo 一条命令回环。
  *
+ * 通用口径（textTokens / classifyBySurfaces / applyBatch / undoBatch）在
+ * scripts/lib/path-split.mjs，跟 P1 的 scripts/migrate-entity-paths.mjs 共用一份；
+ * 本脚本只保留 fake_split 的组定义与 CLI，输出与改动前一致。
+ *
  * 用法：
  *   node scripts/split-path-entities.mjs --dry-run [--db path]
  *   node scripts/split-path-entities.mjs --apply   [--db path] [--backup path]
@@ -32,18 +36,22 @@
  */
 import { backup } from 'node:sqlite';
 import { openDb, DEFAULT_DB_PATH, resolveMemoryFile } from './lib/db.mjs';
+import {
+  expandPath, classifyBySurfaces, applyBatch, undoBatch, tableExists,
+} from './lib/path-split.mjs';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
-import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REAL_DB = DEFAULT_DB_PATH;
 const DEFAULT_BACKUP = resolveMemoryFile('backup/memory-before-pathsplit-20261114.db');
 const RUN_ID = 't-mwfw6ne2-3b15';
-const HOME = os.homedir();
+const REASON = 'fake_split';
+/** fake_split 不新建 surface，这个值只过 applyBatch 的合法值校验，不落库。 */
+const SURFACE_SOURCE_UNUSED = 'migrate';
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(name);
@@ -67,47 +75,6 @@ const GROUPS = [
 ];
 
 const NOW = () => new Date().toISOString();
-const s = (x) => String(x ?? '');
-
-/** ~ 展开、去 ENV= 前缀、去尾斜杠；大小写不动（精确匹配优先）。 */
-function expandPath(p) {
-  let t = s(p).trim().replace(/^[A-Z][A-Z0-9_]*=/, '');
-  if (t === '~') t = HOME;
-  else if (t.startsWith('~/')) t = HOME + t.slice(1);
-  return t.replace(/\/+$/, '');
-}
-
-const baseOf = (p) => {
-  const x = s(p).replace(/\/+$/, '');
-  return x.slice(x.lastIndexOf('/') + 1);
-};
-
-const TOKEN_SPLIT = /[\s，。、；：！？（）()【】\[\]{}"'`<>|—…·]+/u;
-const TOKEN_TRAIL = /[.,:;!?，。；：！？、）】」》*]+$/u;
-
-/**
- * 正文只取带 / 的 token（全路径才算证据）。raw 和去尾标点后的形式都留：
- * raw 用于和 surface 原文精确相等，trim 后用于展开比较（/api/* 这种尾 * 不被误砍）。
- */
-function textTokens(text) {
-  const out = [];
-  for (const raw of s(text).split(TOKEN_SPLIT)) {
-    if (!raw.includes('/')) continue;
-    out.push(raw);
-    const t = raw.replace(TOKEN_TRAIL, '');
-    if (t && t !== raw && t.includes('/')) out.push(t);
-  }
-  return out;
-}
-
-/** surface 行 -> 归属目标键。路径写法按展开后的路径归族；裸写法单独一桶。 */
-function targetKey(surface, norm) {
-  return s(norm).includes('/') ? expandPath(norm) : `<bare:${s(norm)}>`;
-}
-
-function tableExists(db, name) {
-  return !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`).get(name);
-}
 
 function requireTables(db) {
   for (const t of ['entities', 'entity_surface', 'memory_entity', 'memories', 'entity_merge']) {
@@ -133,50 +100,10 @@ function loadGroup(db, spec) {
 
 /** 逐条挂载判归属；只有唯一命中目标写法才算定。 */
 function classify(db, g) {
-  const mounts = db.prepare(`
-    SELECT me.memory_id, me.status AS me_status, m.status AS mem_status, m.text, m.entities
-    FROM memory_entity me JOIN memories m ON m.id = me.memory_id
-    WHERE me.entity_id = ? ORDER BY me.memory_id`).all(g.old.id);
-
-  const out = [];
-  for (const m of mounts) {
-    const tokens = new Set(textTokens(m.text));
-    let raws = [];
-    try { raws = JSON.parse(m.entities || '[]'); } catch { raws = []; }
-    if (Array.isArray(raws)) for (const t of raws) if (typeof t === 'string' && t) tokens.add(t);
-
-    const hits = new Set();
-    for (const t of tokens) {
-      // a) 原文精确相等优先
-      const exact = g.rows.filter((r) => t === r.surface);
-      if (exact.length) {
-        for (const r of exact) hits.add(targetKey(r.surface, r.norm));
-        continue;
-      }
-      // b) 展开后相等（~、尾斜杠、ENV= 前缀）
-      const et = expandPath(t);
-      for (const r of g.rows) if (expandPath(r.norm) === et) hits.add(targetKey(r.surface, r.norm));
-    }
-
-    let mode;
-    let target = null;
-    if (hits.size === 1) {
-      mode = 'unique';
-      target = [...hits][0];
-    } else if (hits.size > 1) {
-      mode = 'ambiguous';
-    } else {
-      const bareHit = [...tokens].some((t) =>
-        g.rows.some((r) => baseOf(t).toLowerCase() === baseOf(r.norm).toLowerCase()));
-      mode = bareHit ? 'bare' : 'none';
-    }
-    out.push({ memory_id: m.memory_id, me_status: m.me_status, mem_status: m.mem_status, mode, target });
-  }
-
-  const moved = out.filter((d) => d.target === g.splitKey);
-  const review = out.filter((d) => d.target === null);
-  const bucket = out.reduce((a, d) => ((a[d.mode] = (a[d.mode] || 0) + 1), a), {});
-  return { mounts: out, moved, review, bucket, mountTotal: out.length };
+  const c = classifyBySurfaces(db, { entityId: g.old.id, rows: g.rows });
+  const moved = c.mounts.filter((d) => d.mode === 'unique' && d.target === g.splitKey);
+  const review = c.mounts.filter((d) => d.target === null);
+  return { mounts: c.mounts, moved, review, bucket: c.bucket, mountTotal: c.mountTotal };
 }
 
 function summarize(db) {
@@ -250,7 +177,7 @@ function dryRun() {
   }
 }
 
-/** 在事务里逐组拆；返回统计。 */
+/** 在事务里逐组拆；返回统计。迁移本体走 scripts/lib/path-split.mjs 的 applyBatch。 */
 function applyAll(db, gs) {
   const stats = { created: 0, skipped: 0, noop: 0, moved: 0, review: 0, groups: [] };
   for (const g of gs) {
@@ -275,71 +202,36 @@ function applyAll(db, gs) {
     if (clash) throw new Error(`${name} 的新实体 norm=${canon} 已存在（id=${clash.id}），不硬撞`);
 
     const ts = NOW();
-    const ins = db.prepare(`
-      INSERT INTO entities(norm,display,etype,attrs,first_seen,last_seen,mem_count,status)
-      VALUES(?,?,?,?,?,?,0,'active')`).run(
-      canon, canon, g.old.etype,
-      JSON.stringify({ split_from: g.old.id, fake_split: name, canonical: canon }),
-      ts, ts,
-    );
-    const newId = Number(ins.lastInsertRowid);
-
-    for (const r of g.splitRows) {
-      const u = db.prepare('UPDATE entity_surface SET entity_id=? WHERE surface=?').run(newId, r.surface);
-      if (u.changes !== 1) throw new Error(`${name} 改指 surface=${r.surface} 影响 ${u.changes} 行`);
-    }
-
-    for (const d of g.moved) {
-      const insMe = db.prepare(`
-        INSERT OR IGNORE INTO memory_entity(memory_id,entity_id,role,ts,status,attrs,version,prev_memory_id,origin)
-        SELECT memory_id, ?, role, ts, status, attrs, version, prev_memory_id, origin
-        FROM memory_entity WHERE entity_id=? AND memory_id=?`).run(newId, g.old.id, d.memory_id);
-      if (insMe.changes !== 1 && !db.prepare('SELECT 1 FROM memory_entity WHERE entity_id=? AND memory_id=?').get(newId, d.memory_id)) {
-        throw new Error(`${name} 搬挂载 ${d.memory_id} 失败（insert changes=${insMe.changes}）`);
-      }
-      const del = db.prepare('DELETE FROM memory_entity WHERE entity_id=? AND memory_id=?').run(g.old.id, d.memory_id);
-      if (del.changes < 1) throw new Error(`${name} 删旧挂载 ${d.memory_id} 影响 0 行`);
-    }
-
-    for (const d of g.review) {
-      const row = db.prepare('SELECT attrs FROM memory_entity WHERE entity_id=? AND memory_id=?').get(g.old.id, d.memory_id);
-      if (!row) throw new Error(`${name} 复核挂载 ${d.memory_id} 不见了`);
-      let attrs = {};
-      try { attrs = JSON.parse(row.attrs || '{}') || {}; } catch { attrs = {}; }
-      const marker = `fake_split:${name}`;
-      const cur = attrs.needs_review;
-      const arr = Array.isArray(cur) ? cur.slice() : (typeof cur === 'string' && cur ? [cur] : []);
-      if (!arr.includes(marker)) arr.push(marker);
-      attrs.needs_review = arr;
-      db.prepare('UPDATE memory_entity SET attrs=? WHERE entity_id=? AND memory_id=?')
-        .run(JSON.stringify(attrs), g.old.id, d.memory_id);
-    }
-
-    const recalc = db.prepare('UPDATE entities SET mem_count=(SELECT count(*) FROM memory_entity WHERE entity_id=?) WHERE id=?');
-    recalc.run(g.old.id, g.old.id);
-    recalc.run(newId, newId);
-
-    const evidence = {
-      group: name,
-      old_id: g.old.id,
-      new_id: newId,
-      keys: g.splitRows.map((r) => r.surface),
-      memories: g.splitRows.map((r) => r.norm),
-      canonical: canon,
-      memory_ids: g.moved.map((d) => d.memory_id),
-      review_memory_ids: g.review.map((d) => d.memory_id),
-      review_marker: `fake_split:${name}`,
-      old_mem_count_before: g.mountTotal,
-    };
-    db.prepare(`
-      INSERT INTO entity_merge(src_entity,dst_entity,reason,evidence,run_id,created_at)
-      VALUES(?,?,'fake_split',?,?,?)`).run(newId, g.old.id, JSON.stringify(evidence), RUN_ID, ts);
-
+    const r = applyBatch(db, {
+      reason: REASON,
+      runId: RUN_ID,
+      source: SURFACE_SOURCE_UNUSED,
+      oldEntityId: g.old.id,
+      now: ts,
+      groups: [{
+        key: name,
+        canonical: canon,
+        etype: g.old.etype,
+        entityAttrs: { fake_split: name },
+        reviewMarker: `fake_split:${name}`,
+        surfaces: g.splitRows.map((x) => ({ kind: 'update', surface: x.surface })),
+        moved: g.moved.map((d) => ({ memoryId: d.memoryId, role: d.role })),
+        review: g.review.map((d) => ({ memoryId: d.memoryId, role: d.role })),
+        evidence: {
+          group: name,
+          keys: g.splitRows.map((x) => x.surface),
+          memories: g.splitRows.map((x) => x.norm),
+          old_mem_count_before: g.mountTotal,
+        },
+      }],
+    });
+    if (!r.created) throw new Error(`${name} 迁移没有落账：${JSON.stringify(r.groups)}`);
+    const g0 = r.groups[0];
     stats.created++;
     stats.moved += g.moved.length;
     stats.review += g.review.length;
-    stats.groups.push({ name, oldId: g.old.id, newId, canonical: canon, moved: g.moved.length, review: g.review.length });
-    console.log(`[split] ${name} ${g.old.id} -> 新实体 ${newId} ${canon}：搬 ${g.moved.length} / 复核 ${g.review.length}`);
+    stats.groups.push({ name, oldId: g.old.id, newId: g0.newId, canonical: canon, moved: g.moved.length, review: g.review.length });
+    console.log(`[split] ${name} ${g.old.id} -> 新实体 ${g0.newId} ${canon}：搬 ${g.moved.length} / 复核 ${g.review.length}`);
   }
   return stats;
 }
@@ -381,60 +273,22 @@ async function apply() {
 function undo() {
   const db = openDb(DB);
   db.exec('PRAGMA busy_timeout=10000');
-  db.exec('BEGIN IMMEDIATE');
-  let n = 0;
-  let restoredMounts = 0;
+  let stats;
   try {
     requireTables(db);
-    const rows = db.prepare(`
-      SELECT * FROM entity_merge
-      WHERE reason='fake_split' AND undone_at=''
-      ORDER BY id DESC`).all();
-    if (!rows.length) {
-      console.log('没有未 undo 的 fake_split 记录，什么都不用做');
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      stats = undoBatch(db, { reason: REASON });
+      db.exec('COMMIT');
+    } catch (e) {
+      db.exec('ROLLBACK');
+      throw e;
     }
-    for (const r of rows) {
-      const ev = JSON.parse(r.evidence || '{}');
-      const src = Number(r.src_entity);
-      const dst = Number(r.dst_entity);
-      const dstRow = db.prepare('SELECT id FROM entities WHERE id=?').get(dst);
-      if (!dstRow) throw new Error(`undo 目标原实体 ${dst} 不存在，停`);
-      const srcRow = db.prepare('SELECT id FROM entities WHERE id=?').get(src);
-      if (srcRow) {
-        const ins = db.prepare(`
-          INSERT OR IGNORE INTO memory_entity(memory_id,entity_id,role,ts,status,attrs,version,prev_memory_id,origin)
-          SELECT memory_id, ?, role, ts, status, attrs, version, prev_memory_id, origin
-          FROM memory_entity WHERE entity_id=?`).run(dst, src);
-        restoredMounts += ins.changes;
-        db.prepare('DELETE FROM memory_entity WHERE entity_id=?').run(src);
-        db.prepare('UPDATE entity_surface SET entity_id=? WHERE entity_id=?').run(dst, src);
-        db.prepare('DELETE FROM entities WHERE id=?').run(src);
-      }
-      const marker = ev.review_marker || `fake_split:${ev.group}`;
-      for (const mid of Array.isArray(ev.review_memory_ids) ? ev.review_memory_ids : []) {
-        const row = db.prepare('SELECT attrs FROM memory_entity WHERE entity_id=? AND memory_id=?').get(dst, mid);
-        if (!row) continue;
-        let attrs = {};
-        try { attrs = JSON.parse(row.attrs || '{}') || {}; } catch { attrs = {}; }
-        const cur = attrs.needs_review;
-        const arr = (Array.isArray(cur) ? cur : (typeof cur === 'string' && cur ? [cur] : [])).filter((x) => x !== marker);
-        if (arr.length) attrs.needs_review = arr;
-        else delete attrs.needs_review;
-        db.prepare('UPDATE memory_entity SET attrs=? WHERE entity_id=? AND memory_id=?')
-          .run(JSON.stringify(attrs), dst, mid);
-      }
-      db.prepare('UPDATE entities SET mem_count=(SELECT count(*) FROM memory_entity WHERE entity_id=?) WHERE id=?').run(dst, dst);
-      db.prepare('UPDATE entity_merge SET undone_at=? WHERE id=?').run(NOW(), r.id);
-      n++;
-      console.log(`[undo] 新实体 ${src} -> 原实体 ${dst}（${ev.group}）`);
-    }
-    db.exec('COMMIT');
-  } catch (e) {
-    db.exec('ROLLBACK');
-    throw e;
   } finally {
     db.close();
   }
+  for (const r of stats.records) console.log(`[undo] 新实体 ${r.src} -> 原实体 ${r.dst}（${r.group}）`);
+  if (!stats.undone) console.log('没有未 undo 的 fake_split 记录，什么都不用做');
   const after = openDb(DB, { readOnly: true });
   try {
     const entities = after.prepare('SELECT count(*) c FROM entities').get().c;
@@ -442,7 +296,7 @@ function undo() {
     const surface = after.prepare('SELECT count(*) c FROM entity_surface').get().c;
     const active = after.prepare(`SELECT count(*) c FROM entity_merge WHERE reason='fake_split' AND undone_at=''`).get().c;
     const marks = after.prepare(`SELECT count(*) c FROM memory_entity WHERE json_array_length(json_extract(attrs,'$.needs_review')) > 0`).get().c;
-    console.log(`还原完成：undo ${n} 笔 / 回搬挂载 ${restoredMounts} 行`);
+    console.log(`还原完成：undo ${stats.undone} 笔 / 回搬挂载 ${stats.restoredMounts} 行`);
     console.log(`库现在：实体 ${entities} / 挂载 ${mounts} / surface ${surface} 行 / 未 undo 的 fake_split ${active} / needs_review 标记 ${marks}`);
   } finally {
     after.close();
