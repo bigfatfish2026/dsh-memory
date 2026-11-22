@@ -27,15 +27,16 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { dueOps, markOp, MAX_ATTEMPTS, type DueOp } from './ingest-index.js';
 import { sha1Hex } from './fingerprint.js';
-import { split } from './agents/split.js';
+import { recordSplitFailure, split } from './agents/split.js';
 import { lintReviewMeta } from './lint-review.js';
-import { deleteSupersedesLink, hasMemoryLinkTable, writeSupersedesLink } from './memory-link.js';
+import { deleteSupersedesLink, hasMemoryLinkTable, isAutoObservation, writeSupersedesLink } from './memory-link.js';
 import {
   PARTIAL_SPLIT_REASON, PENDING_SPLIT_STATUS, pendingSplitIds, splitGroupFromRecords, splitGroupGap,
 } from './store/split-group.js';
 import type { SplitGroupStore, SplitGroupView } from './store/split-group.js';
 import type { MemoryRecord, Row } from './store/types.js';
 import type { LlmServiceLike } from './llm-service.js';
+import type { SplitVerdictCache } from './split-verdict-cache.js';
 
 /** 与 sleep.js 的 ingest 硬顶同口径；调用方给多大这里都再夹一次。 */
 const SPLIT_HARD_CAP = 64;
@@ -51,6 +52,8 @@ export const PRODUCER_WAIT_TIMEOUT_MS = 15 * 60 * 1000;
 /** split() 的返回面（agents/split() 已类型化，这里收窄成消费端要用的字段）。 */
 export interface SplitAnswer {
   unavoidable?: boolean;
+  /** 模型给的不可拆理由（写进判定缓存，下次命中时回显）。 */
+  reason?: string;
   rounds?: number;
   /** 最终布局的切点（parts[i+1].start），二次切分与 lint 重做之后。 */
   cuts?: number[];
@@ -124,6 +127,11 @@ export interface SplitConsumeOpts {
    * 不传就是单次调用内部一份新数组（行为与以前一致）。
    */
   skipOpIds?: Array<string | number>;
+  /**
+   * 「不可拆」判定缓存（2026-11-22）：跨轮存在 sleep.state.json 的 splitVerdictCache 字段。
+   * 不传就不启用（其它调用点/测试行为不变）；pool-pass 传真实的 stateStore 包装。
+   */
+  verdictCache?: SplitVerdictCache | null;
 }
 
 /**
@@ -169,6 +177,10 @@ export interface SplitStats {
   pendingAfter: number;
   /** inflate 到 attempts 上限直接判死的条数。 */
   inflateDead: number;
+  /** 命中「不可拆」判定缓存、没问模型的条数；省下的模型调用次数与它相同。 */
+  cacheHits: number;
+  /** 自动观察被挡在普通拆分外的条数（入口已挡，这里兜旧队列里已经入队的）。 */
+  autoObservationSkipped: number;
 }
 
 /**
@@ -188,6 +200,16 @@ export interface SplitStatsBreakdown {
   coverageBlocked: number;
   unavoidable: number;
   inflateDead: number;
+}
+
+/**
+ * 一条拆活的类型：payload.type → store.typeOf(source) → 'world'。
+ * 2026-11-22 从问模型那段的内联表达式收出来：缓存命中回队时也要用同一份判定。
+ */
+function splitTypeOf(store: SplitStore, payload: Row | null, source: MemoryRecord | null): string {
+  return String(payload?.type || '')
+    || (source && typeof store.typeOf === 'function' ? String(store.typeOf(source)) : '')
+    || 'world';
 }
 
 /** 从 store 里取原条：优先 payload.text，库里没有就用 payload 文本（merge 产出的 add 候选没有 id）。 */
@@ -504,6 +526,8 @@ function mergeSplitStats(into: SplitStats, from: SplitStats): SplitStats {
   into.dedupedOnly += from.dedupedOnly;
   into.pendingAfter += from.pendingAfter;
   into.inflateDead += from.inflateDead;
+  into.cacheHits += from.cacheHits;
+  into.autoObservationSkipped += from.autoObservationSkipped;
   into.concurrency = Math.max(into.concurrency, from.concurrency);
   return into;
 }
@@ -625,12 +649,14 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
     signalsStrict = false,
     concurrency = 1,
     writeLock = null,
+    verdictCache = null,
   } = opts;
   const stats: SplitStats = {
     scanned: 0, tried: 0, unavailable: 0, unavoidable: 0, archived: 0,
     inserted: 0, deduped: 0, parts: 0, rejected: 0, failed: 0, skipped: 0,
     charsBefore: 0, charsAfter: 0, concurrency: 0, versionMismatch: 0, coverageBlocked: 0,
     succeeded: 0, dedupedOnly: 0, pendingAfter: 0, inflateDead: 0,
+    cacheHits: 0, autoObservationSkipped: 0,
   };
   if (!db || !store) return stats;
   // memory_link 表在不在：一轮判一次（每条都判会刷屏）。缺表只提醒一次，边跳过、拆分照常落库。
@@ -713,6 +739,17 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
         }
       }
 
+      // 自动观察不进普通拆分（2026-11-22）：它有自己的复核链路（按来源根算独立来源、
+      // 够 2 条才升级），拆出来的子段没有 derived_from 证据边，等于凭空造断言。
+      // 入口（sleep/pool.ts 的超长入队、split-pass.ts 的 targets）已挡，这里兜旧队列里已入队的。
+      if (isAutoObservation(source)) {
+        markOp(db, op.id, 'done', 'auto_observation_skip', { now: nowOf(), dryRun, log });
+        stats.skipped += 1;
+        stats.autoObservationSkipped += 1;
+        log?.(`[split] item=${sourceId} 自动观察跳过普通拆分 op=${op.id}`);
+        continue;
+      }
+
       if (!source && !text.trim()) {
         // 没 id 也没正文：重试一百次也不会变，终态 done，不静默
         markOp(db, op.id, 'done', 'source_missing', { now: nowOf(), dryRun, log });
@@ -757,6 +794,28 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
         }
       }
 
+      // 「不可拆」判定缓存（2026-11-22）：同一正文 + 同一字数上限 + 同一规则版本不重复问模型。
+      // 命中仍按不可拆处理：recordSplitFailure 照旧落 pending、attempts+1，原文一个字不动；
+      // 不影响 failedThisRound 的同轮去重，也不进 stats.tried（确实没调模型）。
+      const cached = verdictCache ? verdictCache.hit(text, maxChars) : null;
+      if (cached) {
+        stats.unavoidable += 1;
+        stats.pendingAfter += 1;
+        stats.cacheHits += 1;
+        failedThisRound.push(op.id);
+        recordSplitFailure(db, {
+          sourceId,
+          text,
+          type: splitTypeOf(store, payload, source),
+          reason: `unavoidable: cached: ${cached.reason || 'unavoidable'}`,
+          attempt: Number(op.attempts) || 0,
+          log,
+          now: nowOf(),
+        });
+        log?.(`[split] item=${sourceId} unavoidable 命中判定缓存，未调模型 ms=0`);
+        continue;
+      }
+
       tasks.push({ op, sourceId, text, source, payload });
     }
 
@@ -775,9 +834,7 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
           answer = await split({
             sourceId: task.sourceId,
             text: task.text,
-            type: task.payload.type as string
-              || (task.source && typeof store.typeOf === 'function' ? store.typeOf(task.source) : '')
-              || 'world',
+            type: splitTypeOf(store, task.payload, task.source),
             ts: task.payload.ts as string || task.source?.ts || '',
             llm,
             provider,
@@ -827,6 +884,9 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
           stats.unavoidable += 1;
           stats.pendingAfter += 1;
           failedThisRound.push(op.id);
+          // 记进判定缓存（存 sleep.state.json，跨轮存活）：下一轮同一正文 + 同一上限 +
+          // 同一规则版本不再问模型。正文变了键就变，自然重问。
+          verdictCache?.remember(task.text, maxChars, String(answer.reason || 'unavoidable'));
           log?.(`[split] item=${sourceId} unavoidable 已落 pending ms=${ms}`);
           return;
         }
@@ -1109,7 +1169,8 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
       `[split] 并发 ${peakConc || Math.min(conc, stats.scanned)} 路 条 ${stats.scanned} ` +
         `落库 ${b.succeeded} 全判重 ${b.dedupedOnly} 跳过 ${b.skipped} 回队 ${b.pendingAfter}（含不可拆 ${b.unavoidable}） ` +
         `版本不符 ${b.versionMismatch} 覆盖未过 ${b.coverageBlocked} 判死 ${b.inflateDead} ` +
-        `失败 ${stats.failed} 分类合计 ${sum}`,
+        `失败 ${stats.failed} 分类合计 ${sum} 缓存命中 ${stats.cacheHits} ` +
+        `自动观察跳过 ${stats.autoObservationSkipped}`,
     );
     if (sum !== stats.scanned) {
       // 有 op 没落分类（比如 commit 抛错、行还挂在 running）：当场说清楚，别让汇总看着齐整。
@@ -1119,6 +1180,18 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
         : `多记 ${sum - stats.scanned} 条（查重复入账）`;
       log?.(`[split] WARN 分类合计 ${sum} 与条 ${stats.scanned} 不符：${diff}`);
     }
+  }
+
+  // 判定缓存统计（2026-11-22）：接了缓存就每轮打一行，命中 0 也打。
+  // 「不能静默全不命中」靠这行的 size / rules：字段被升级读丢时 size=0，
+  // SPLIT_RULES 文本改过时 rules 串变，一眼能看出来。dryRun 不写 state。
+  if (verdictCache) {
+    const size = dryRun ? verdictCache.size() : verdictCache.flush();
+    log?.(
+      `[split] verdict-cache hit=${stats.cacheHits} saved_llm=${stats.cacheHits} ` +
+        `added=${verdictCache.added()} size=${size} max=${verdictCache.max} ` +
+        `rules=${verdictCache.ruleVersion} 自动观察跳过=${stats.autoObservationSkipped}`,
+    );
   }
   return stats;
 }

@@ -11,8 +11,8 @@
  *
  * 同步写、同步读：并发语义跟原来一样（Node 单线程里一次调用一个写），
  * 唯一的额外保护是禁止嵌套 update（防「patch 里又 patch」写出半截状态）。
- * 字段一个都不改：lastSleepAt/slots/owedSlots/owner/runningAt/heartbeatAt/organizeCache
- * 还是调用方说了算，这个对象只负责搬运。
+ * 字段一个都不改：lastSleepAt/slots/owedSlots/owner/runningAt/heartbeatAt/organizeCache/
+ * splitVerdictCache 还是调用方说了算，这个对象只负责搬运。
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,6 +30,11 @@ export interface SleepState {
   slots?: Record<string, unknown>;
   owedSlots?: Record<string, unknown>;
   organizeCache?: Record<string, unknown>;
+  /**
+   * 「不可拆」判定缓存（2026-11-22）：键 = 正文 sha1|字数上限|规则版本，
+   * 值 {reason,t}。读写与上限淘汰都在 src/split-verdict-cache.ts。
+   */
+  splitVerdictCache?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -54,7 +59,7 @@ function asSleepState(raw: unknown): SleepState | null {
     || (v !== null && typeof v === 'object' && !Array.isArray(v));
   if (!numOrMissing(s.lastSleepAt) || !strOrMissing(s.lastSleepDay)) return null;
   if (!strOrMissing(s.owner) || !numOrMissing(s.runningAt) || !numOrMissing(s.heartbeatAt)) return null;
-  for (const key of ['slots', 'owedSlots', 'organizeCache']) {
+  for (const key of ['slots', 'owedSlots', 'organizeCache', 'splitVerdictCache']) {
     if (!objOrMissing(s[key])) return null;
   }
   return s as SleepState;

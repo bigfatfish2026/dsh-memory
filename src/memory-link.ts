@@ -90,11 +90,21 @@ export const OBSERVATION_ARCHIVED_REASON_PREFIX = 'evidence-';
  *
  * 放在 memory-link 而不是 observation-records：本文件不依赖 store 层任何模块，
  * entities / search 两处调用方都不会和 observation-records 形成循环导入。
+ *
+ * isAutoObservation 是它的下位判据：只看 extra.autoObservation 标记、不分状态。
+ * 自动观察有自己的复核链路（按来源根算独立来源），不许再进普通拆分/合并入口，
+ * 那类通道隔离用 isAutoObservation，别误用 isHiddenObservation（active 的自动观察不隐藏）。
  */
+export function isAutoObservation<T extends object>(
+  m: T | null | undefined,
+): m is T & { autoObservation: true } {
+  return Boolean(m && (m as { autoObservation?: unknown }).autoObservation === true);
+}
+
 export function isHiddenObservation(
   m: { status?: unknown; reason?: unknown; autoObservation?: unknown } | null | undefined,
 ): boolean {
-  if (!m || m.autoObservation !== true) return false;
+  if (!isAutoObservation(m)) return false;
   const status = String(m.status || 'active').toLowerCase();
   if (status === OBSERVATION_PENDING_REVIEW_STATUS) return true;
   return status === 'archived' && String(m.reason || '').startsWith(OBSERVATION_ARCHIVED_REASON_PREFIX);

@@ -2,6 +2,7 @@
  * 合并 agent 路径：分簇 → merge() → 证据校验 → 逐条落地 → 账本重放 → 超长转拆分。
  */
 import { consumeSplitOps } from '../pipeline-split.js';
+import { createSplitVerdictCache } from '../split-verdict-cache.js';
 import { merge as askMergeOps, validateOps } from '../agents/merge.js';
 import { llmOf, isLlmUnavailable } from '../llm-service.js';
 import { selectIngestConcurrency, formatIngestAdaptiveLog } from '../concurrency.js';
@@ -371,6 +372,11 @@ async function organizePassAgent({ dryRun = false } = {}) {
       // （organizeIngestAdaptive 开关 + 本机负载算法，cap 64），开跑前算一次，整段固定不抖。
       const splitPick = selectIngestConcurrency(cfg);
       if (splitPick.adaptive) log(cfg, formatIngestAdaptiveLog(splitPick, '[split]'));
+      // 「不可拆」判定缓存（2026-11-22）：legacy 整理路径也接同一份 sleep.state.json 缓存，
+      // 两种 organizePipelineMode 行为一致。命中就不再问模型（pipeline-split 内统计）。
+      const splitVerdictCache = createSplitVerdictCache(stateStore, {
+        log: (line: string) => log(cfg, line),
+      });
       splitAgent = await consumeSplitOps({
         textLint: cfg.pipeline?.textLint !== false,
         lintReview: cfg.pipeline?.lintReview !== false,
@@ -388,6 +394,7 @@ async function organizePassAgent({ dryRun = false } = {}) {
         limit: Infinity,
         concurrency: splitPick.conc,
         maxChars: Number(cfg.splitMaxChars) || 200,
+        verdictCache: splitVerdictCache,
         log: (line: string) => log(cfg, line),
       } as unknown as Parameters<typeof consumeSplitOps>[0]);
       if (splitAgent.scanned) {

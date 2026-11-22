@@ -8,11 +8,12 @@ import { createChannelPool, runListPool } from '../pool.js';
 import { kindsOfPool } from '../kind-handlers.js';
 import { merge as askMergeOps, validateOps, groupOpsOf } from '../agents/merge.js';
 import { llmOf } from '../llm-service.js';
+import { isAutoObservation } from '../memory-link.js';
 import { dayKey } from './slots.js';
 import { CLUSTER_PROMPT_SHELL_TOKENS } from './batching.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { DueOp } from '../ingest-index.js';
-import type { MemoryView, SnapshotView, Row } from '../store/types.js';
+import type { MemoryRecord, MemoryView, SnapshotView, Row } from '../store/types.js';
 import type { BatchPlanner } from '../batch-planner.js';
 import type { PromptBudget } from '../token-window.js';
 import type { SleepCfg, SleepCtx, SleepStore } from './env.js';
@@ -278,11 +279,25 @@ function planPoolQueues(db: DatabaseSync, { dryRun, lastSleepAt }: { dryRun: boo
     out.merge += 1;
   }
 
-  // ③ curate 通道的拆分活：超长条目入 split_item（先判状态，别每轮把已完的又塞一遍）
+  // ③ curate 通道的拆分活：超长条目入 split_item（先判状态，别每轮把已完的又塞一遍）。
+  // 自动观察不进普通拆分（2026-11-22）：它有自己的复核链路（按来源根算独立来源、够 2 条
+  // 才升级），普通拆分产出的子段没有 derived_from 证据边。消费端（pipeline-split）再兜一层。
   const threshold = Number(cfg.splitMaxChars) || 200;
+  // MemoryView 是瘦视图、不带 extra 里的 autoObservation 标记，从 store.metas() 取原始记录建 id 集合。
+  // 测试桩没 metas 时退化成空集合（不排除），行为跟以前一致。
+  const autoObservationIds = new Set<string>(
+    (typeof store.metas === 'function' ? (store.metas() as MemoryRecord[]) : [])
+      .filter((m) => isAutoObservation(m))
+      .map((m) => String(m.id)),
+  );
+  let autoObservationSkipped = 0;
   for (const m of all) {
     const text = String(m.text || '');
     if (text.length <= threshold) continue;
+    if (autoObservationIds.has(String(m.id))) {
+      autoObservationSkipped += 1;
+      continue;
+    }
     enqueue(db, 'split_item', String(m.id), {
       source_id: String(m.id),
       text,
@@ -293,6 +308,9 @@ function planPoolQueues(db: DatabaseSync, { dryRun, lastSleepAt }: { dryRun: boo
       batch: 'pool',
     }, { dryRun, log: (line: string) => log(cfg, line) });
     out.split += 1;
+  }
+  if (autoObservationSkipped) {
+    log(cfg, `[pool] split 入队跳过自动观察 ${autoObservationSkipped} 条（走观察复核链路，不进普通拆分）`);
   }
 
   // ④ compact：作废清扫每天一条（dedupe_key 带日期，幂等）；organizeCache 轮转在池收尾做。

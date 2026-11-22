@@ -3,6 +3,7 @@
  */
 import path from 'node:path';
 import { consumeSplitOpsWithRecheck } from '../pipeline-split.js';
+import { createSplitVerdictCache } from '../split-verdict-cache.js';
 import {
   claimChannelOps, reapChannelOps, channelStats, markOp, failFile, hasIngestTables, LEASE_MS,
 } from '../ingest-index.js';
@@ -263,6 +264,11 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
     // 2026-11-20：合并/入库两路池在本轮收尾之前还在往队列里排 split_item，而拆分以前一领空就收工
     // （11:08:02 那轮收尾后又排了 450 行入队事件，任务去重后 397 条 pending 一条没领）。
     // 这个 promise 在 ingest/merge 两路池 drain 完之后 resolve，split 等到它再补扫一轮。
+    // 「不可拆」判定缓存（2026-11-22，t-mwriwazy-de37）：跨轮存在 sleep.state.json 的
+    // splitVerdictCache 字段，跟 organizeCache 同一套 stateStore 机制；命中就不再问模型。
+    const splitVerdictCache = createSplitVerdictCache(stateStore, {
+      log: (line: string) => log(cfg, line),
+    });
     let producersFinished!: () => void;
     const producersDone = new Promise<void>((resolve) => { producersFinished = resolve; });
     const splitTask = (async () => {
@@ -285,10 +291,12 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
           log: poolLog,
           // 领空后等生产者收工再补扫；没活就停，最多 3 轮
           awaitProducers: () => producersDone,
+          verdictCache: splitVerdictCache,
         } as unknown as Parameters<typeof consumeSplitOpsWithRecheck>[0]);
         curateStats.split = {
           scanned: sv.scanned, inserted: sv.inserted, deduped: sv.deduped, archived: sv.archived,
           failed: sv.failed, succeeded: sv.succeeded, pendingAfter: sv.pendingAfter, concurrency: sv.concurrency,
+          cacheHits: sv.cacheHits, autoObservationSkipped: sv.autoObservationSkipped,
         };
         return sv;
       } catch (error) {
@@ -376,7 +384,8 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
           `落库 ${splitSv.succeeded || 0} 全判重 ${splitSv.dedupedOnly || 0} 跳过 ${splitSv.skipped || 0} ` +
           `回队 ${splitSv.pendingAfter || 0}（含不可拆 ${splitSv.unavoidable || 0}） 版本不符 ${splitSv.versionMismatch || 0} ` +
           `覆盖未过 ${splitSv.coverageBlocked || 0} 判死 ${splitSv.inflateDead || 0} ` +
-          `失败 ${splitSv.failed || 0}`,
+          `失败 ${splitSv.failed || 0} 缓存命中 ${splitSv.cacheHits || 0} ` +
+          `自动观察跳过 ${splitSv.autoObservationSkipped || 0}`,
       );
     }
     const revokeArchived = compactStats.revoked || 0;

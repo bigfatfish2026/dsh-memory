@@ -24,6 +24,7 @@ import * as paths from './shared/paths.js';
 import type { LintBatchResult } from './text-lint.js';
 import type { MemoryRecord } from './store/types.js';
 import { enqueueSplitItem } from './split-queue.js';
+import { isAutoObservation } from './memory-link.js';
 import { lintItems } from './text-lint.js';
 import {
   judgeSuspected, buildLintRedoFeedback, mergeReviewRejects, lintKeptMarker, lintReviewMeta,
@@ -374,7 +375,13 @@ export async function runSplitPass({
   const state = readState(stateFile);
   const all = store.listAll().filter((m) => m.status === 'active');
   const wanted = new Set(ids.map(String));
-  let targets = all.filter((m) => m.text.length > threshold);
+  // 自动观察不进普通拆分（2026-11-22）：跟 sleep 池的入队侧同一口径。
+  // 手动 memory_split 也要挡，否则它照样能把自动观察拆出没有证据边的子条。
+  const autoObservationSkipped = all.filter((m) => m.text.length > threshold && isAutoObservation(m)).length;
+  let targets = all.filter((m) => m.text.length > threshold && !isAutoObservation(m));
+  if (autoObservationSkipped) {
+    appendLog(logFile, `[split] skip_auto_observation n=${autoObservationSkipped}（自动观察走复核链路）`);
+  }
   if (wanted.size) targets = targets.filter((m) => wanted.has(m.id));
   if (!force) targets = targets.filter((m) => !state.ids?.[m.id]);
   targets.sort((a, b) => b.text.length - a.text.length);
@@ -685,5 +692,6 @@ export async function runSplitPass({
   }
 
   appendLog(logFile, `本轮完成 待拆=${targets.length} 实拆=${tried} 成功=${split} 失败=${failed} dryRun=${dryRun}`);
-  return { scanned: all.filter((m) => m.text.length > threshold).length, tried, split, inserted, deduped, archived, failed, dryRun, details };
+  // scanned 的旧语义是「全库超长待拆条数」，保持不受 ids 过滤影响；只把自动观察剔出去。
+  return { scanned: all.filter((m) => m.text.length > threshold && !isAutoObservation(m)).length, tried, split, inserted, deduped, archived, failed, dryRun, details };
 }
