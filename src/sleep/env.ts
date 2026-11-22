@@ -4,11 +4,12 @@
  * 状态归属：轮级可变状态 inFlight / roundSnapshot /
  * mergeBatchCache / stageLogged 归 SlotScheduler，env 上不留副本；子模块不许各持一份。
  */
-import { createBatchPlanner } from '../batch-planner.js';
+import { createBatchPlanner, cosine } from '../batch-planner.js';
 import { runNotify } from '../shared/notify.js';
 import { batchMaxCos } from '../cluster.js';
+import { foldForMatch } from '../shared/entity-normalize.js';
 import {
-  estimateTokens, promptBudgetOf, itemTokensOf, logWindowOnce,
+  estimateTokens, promptBudgetOf, logWindowOnce, packByTokens,
 } from '../token-window.js';
 import { stateOf } from './state-access.js';
 import { snapshot } from './backup.js';
@@ -86,6 +87,16 @@ export interface SleepCfg {
   funnelTimeWindowDays?: unknown;
   funnelMaxBatches?: unknown;
   conflictCheckEnabled?: unknown;
+  /** 冲突预判（decision 桥）：默认关，关着时 runConflictCheck 与加这层之前一致。 */
+  conflictDecide?: {
+    enabled?: unknown;
+    batchSize?: unknown;
+    minConfidence?: unknown;
+    timeoutMs?: unknown;
+    baseUrl?: unknown;
+    model?: unknown;
+    [key: string]: unknown;
+  };
   entityTidy?: { apply?: unknown; [key: string]: unknown };
   pipeline?: {
     lintReview?: boolean;
@@ -94,6 +105,8 @@ export interface SleepCfg {
     ingestAck?: boolean;
     agentPipeline?: boolean;
     writeGate?: boolean;
+    /** 段级信号是否硬拒（默认 false = 只记）；阶段二才开。 */
+    splitSignalsStrict?: boolean;
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -184,6 +197,30 @@ export interface SleepEnv extends SleepEnvCore {
   pool: ReturnType<typeof createPool>;
   poolPass: ReturnType<typeof createPoolPass>;
   passes: ReturnType<typeof createPasses>;
+}
+
+/**
+ * 本批候选上限：只决定「这一份 prompt 最多带多少条记忆」，不是 token 预算。
+ * token 上限仍由 memoryBudgetTokens()（真实窗口）算，两者取先撞上的那个。
+ */
+const MEMORY_CANDIDATE_CAP = 300;
+
+/** 兜底窗口：候选没占满上限时只补最近这几天的条目，不再退回「把整库铺满」。 */
+const MEMORY_RECENT_FALLBACK_DAYS = 7;
+
+/** 一组向量的质心：缺向量、维度不一致的丢掉；一条都不可用返回 null。 */
+function centroidOf(vecs: Array<Float32Array | undefined>): Float32Array | null {
+  let dim = 0;
+  const usable: Float32Array[] = [];
+  for (const v of vecs) {
+    if (!v?.length) continue;
+    if (!dim) dim = v.length;
+    if (v.length === dim) usable.push(v);
+  }
+  if (!usable.length) return null;
+  const out = new Float32Array(dim);
+  for (const v of usable) for (let i = 0; i < dim; i += 1) out[i] += v[i];
+  return out;
 }
 
 export function createSleepEnv(ctx: SleepCtx, store: SleepStore, cfg: SleepCfg): SleepEnvCore {
@@ -286,45 +323,101 @@ export function createSleepEnv(ctx: SleepCtx, store: SleepStore, cfg: SleepCfg):
     return Math.max(0, budget - shell);
   }
 
+  /**
+   * 本批现有记忆：实体字面命中 + 向量邻域取候选，剩余名额给最近条目兜底，再按窗口预算装。
+   *
+   * 2026-11-20：以前按 token 预算把整库等距铺满（一轮 47 个文件各拼一份，sleep:askModel
+   * 单次输入 81.5 万 token，其中 listing 74 万）。现在先筛后装：
+   *   - 候选：本批记录里字面出现的实体（foldForMatch 折叠后比较）命中的条目，加上这些条目
+   *     的向量邻域（命中条目向量取质心算余弦），最多 MEMORY_CANDIDATE_CAP 条；
+   *   - 兜底：候选没占满上限时，按 ts 倒序补最近 MEMORY_RECENT_FALLBACK_DAYS 天的条目，
+   *     防止候选为空时 prompt 里一条现有记忆都没有；
+   *   - 上限仍走 memoryBudgetTokens()（token-window 的真实窗口），这里不另设条数/字符预算。
+   *
+   * 跨主题的重复在这一层看不见：不在这里补，阶段二 organizePass（src/sleep/passes.ts:192）
+   * 会把全库聚成小批逐批问模型，去重是那一层的活。
+   */
   function memoryTexts(transcript = ''): MemoryView[] {
     const budget = memoryBudgetTokens(transcript);
-    const costOf = (m: MemoryView) => itemTokensOf(m, (x) => String(x?.text || ''), MEMORY_ITEM_OVERHEAD_TOKENS);
-    const all = store.listAll().filter((m) => (m.status || 'active') === 'active');
-    const lower = String(transcript || '').toLowerCase();
-    const relevant = (m: MemoryView) =>
-      (m.entities || []).some((e) => String(e).length >= 2 && lower.includes(String(e).toLowerCase()));
-    const picked: MemoryView[] = [];
-    const seen = new Set<string>();
-    let used = 0;
-    const take = (m: MemoryView) => {
-      if (!m || seen.has(m.id)) return false;
-      const cost = costOf(m);
-      if (used + cost > budget) return false;
-      seen.add(m.id);
-      picked.push(m);
-      used += cost;
-      return true;
+    const snap = activeSnap();
+    const listed = snap.list;
+    const folded = foldForMatch(transcript);
+    // 同一个实体名在库里成百上千条：折叠 + 判命中各算一次，后面的条目直接查表
+    const hitCache = new Map<string, boolean>();
+    const hitOf = (e: unknown): boolean => {
+      const raw = String(e);
+      let got = hitCache.get(raw);
+      if (got === undefined) {
+        const f = foldForMatch(raw);
+        got = f.length >= 2 && folded.includes(f);
+        hitCache.set(raw, got);
+      }
+      return got;
     };
 
-    // 1) 跟本轮会话实体相关的先占位
-    for (const m of all) if (relevant(m)) take(m);
+    // 1) 实体字面命中：命中实体多的排前面，同分按时间倒序
+    const entityHits = listed
+      .map((m) => ({ m, hits: (m.entities || []).reduce((n, e) => n + (hitOf(e) ? 1 : 0), 0) }))
+      .filter((x) => x.hits > 0)
+      .sort((a, b) => b.hits - a.hits || String(b.m.ts || '').localeCompare(String(a.m.ts || '')));
 
-    // 2) 其余按时间等距抽样，铺满剩余 token
-    const rest = all.filter((m) => !seen.has(m.id));
-    if (rest.length) {
-      const room = budget - used;
-      const avg = rest.reduce((s, m) => s + costOf(m), 0) / rest.length;
-      const want = Math.min(rest.length, Math.max(0, Math.floor(room / Math.max(avg, MEMORY_ITEM_OVERHEAD_TOKENS))));
-      if (want >= rest.length) {
-        for (const m of rest) take(m);
-      } else if (want > 0) {
-        const step = rest.length / want;
-        for (let k = 0; k < want; k += 1) take(rest[Math.floor(k * step)]);
-      }
-      // 3) 还有余量就从最近往前补
-      for (let i = rest.length - 1; i >= 0 && used < budget; i -= 1) take(rest[i]);
+    const picked: MemoryView[] = [];
+    const seen = new Set<string>();
+    const take = (m: MemoryView | undefined): boolean => {
+      if (!m || seen.has(m.id)) return true;
+      if (picked.length >= MEMORY_CANDIDATE_CAP) return false;
+      seen.add(m.id);
+      picked.push(m);
+      return true;
+    };
+    for (const x of entityHits) if (!take(x.m)) break;
+    const afterHits = picked.length;
+
+    // 2) 向量邻域：命中条目的向量质心，按余弦把同主题的近邻补满候选
+    const centroid = centroidOf(entityHits.map((x) => snap.vecOf.get(x.m.id)));
+    if (centroid && picked.length < MEMORY_CANDIDATE_CAP) {
+      const near = listed
+        .filter((m) => !seen.has(m.id))
+        .map((m) => {
+          const v = snap.vecOf.get(m.id);
+          return { m, cos: v ? cosine(v, centroid) : null };
+        })
+        .filter((x): x is { m: MemoryView; cos: number } => x.cos !== null && x.cos > 0)
+        .sort((a, b) => b.cos - a.cos);
+      for (const x of near) if (!take(x.m)) break;
     }
-    return picked;
+    const afterVec = picked.length;
+
+    // 3) 兜底：候选没占满上限时补最近几天的条目（候选空时至少不让 prompt 空转）
+    if (picked.length < MEMORY_CANDIDATE_CAP) {
+      const recentCut = Date.now() - MEMORY_RECENT_FALLBACK_DAYS * 86400000;
+      const recent = listed
+        .filter((m) => {
+          const t = Date.parse(String(m.ts || ''));
+          return Number.isFinite(t) && t >= recentCut;
+        })
+        .sort((a, b) => String(b.ts || '').localeCompare(String(a.ts || '')));
+      for (const m of recent) if (!take(m)) break;
+    }
+
+    // 4) 按窗口预算装：窗口未知（Infinity）时整份候选都带，条数已被上限压住；
+    //    窗口已知但一条都装不下时交空表（旧行为：预算 0 什么都取不到）
+    let packed: MemoryView[];
+    if (!Number.isFinite(budget)) packed = picked;
+    else if (budget <= 0) packed = [];
+    else packed = packByTokens(picked, {
+      budget,
+      textOf: (m) => String(m.text || ''),
+      overhead: MEMORY_ITEM_OVERHEAD_TOKENS,
+    }).picked;
+
+    log(
+      cfg,
+      `[sleep] 现有记忆候选 实体命中=${afterHits} 向量邻域=${afterVec - afterHits}`
+        + ` 兜底=${picked.length - afterVec} 传入=${packed.length} 上限=${MEMORY_CANDIDATE_CAP}`
+        + ` 预算=${Number.isFinite(budget) ? Math.round(budget) : '未知'}`,
+    );
+    return packed;
   }
 
   // 段位（scheduler / lint / …）由 setupSleep 按依赖顺序挂上；这里先按最终形状交出去。
