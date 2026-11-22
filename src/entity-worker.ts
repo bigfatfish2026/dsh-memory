@@ -235,6 +235,35 @@ function finishRun(db: DatabaseSync, runId: string | null, { state = 'done', cur
 }
 
 /**
+ * 回收僵尸 curate_run（2026-11-20）。
+ *
+ * 以前只有 startRun / finishRun：进程被 kill、插件重载、或者崩在活里，那一行就永远停在
+ * state='executing'（库里 6 条 executing，owner pid 全 GONE，最早 11-18、最新 11-19）。
+ * curate_queue 那边有 reapExpired（entity-queue.ts:263），curate_run 一直没有对应的回收，
+ * 于是 channelStats 和人工排查都按「还在跑」看待。
+ *
+ * 口径跟实体队列一致：只认 lease_expires 过期（>0 且 <now）；lease_expires=0 是 finishRun
+ * 写过的收尾行，不动。置 aborted 不置 done：done 是「正常跑完」，僵尸不是；行不删，
+ * stop_reason 留 lease_expired 方便回查。
+ *
+ * @returns {number} 回收了几条
+ */
+export function reapStaleRuns(db: DatabaseSync | null | undefined, { now = Date.now(), state = 'aborted' }: { now?: number; state?: string } = {}): number {
+  if (!db) return 0;
+  try {
+    const got = db.prepare(
+      `UPDATE curate_run
+          SET state=?, updated_ts=?, stop_reason=?
+        WHERE state='executing' AND lease_expires>0 AND lease_expires<?`,
+    ).run(state, now, 'lease_expired', now).changes;
+    return Number(got) || 0;
+  } catch {
+    // 表不在（老库没跑 apply-curate-schema）/ 表坏了：不拦队列本身
+    return 0;
+  }
+}
+
+/**
  * 消费一批。
  * @returns {Promise<null|{claimed:number, accepted:number, rejected:object, failed:number, done:number}>}
  */
@@ -535,6 +564,9 @@ export async function runEntityQueueOnce({
   if (pick.adaptive) slog(formatStageAdaptiveLog('entity-queue', pick));
   const reaped = reapExpired(db, { now });
   if (reaped) slog(`[entity-queue] 租约过期捞回 ready：${reaped} 条`);
+  // 每轮开跑时顺手收掉上一实例留下的僵尸 run（进程崩在中途时 startRun 那行不会收尾）
+  const staleRuns = reapStaleRuns(db, { now });
+  if (staleRuns) slog(`[entity-queue] curate_run 僵尸回收：${staleRuns} 条 executing→aborted（租约过期）`);
 
   const runId = startRun(db, { now });
   const t0 = Date.now();
@@ -631,6 +663,9 @@ export function setupEntityQueue(ctx: unknown, store: QueueStoreLike, cfg: Entit
     if (typeof timer.unref === 'function') timer.unref();
     firstTimer = setTimeout(() => void tick('first'), FIRST_TICK_MS);
     if (typeof firstTimer.unref === 'function') firstTimer.unref();
+    // 进程启动时先收一次：上一个进程崩在中途留下的 executing 行不会有人替它 finishRun
+    const staleRuns = reapStaleRuns(store.db!());
+    if (staleRuns) entityLog(cfg, `[entity-queue] curate_run 僵尸回收：${staleRuns} 条 executing→aborted（进程启动）`);
     entityLog(cfg, `[entity-queue] 调度已挂：每 ${Math.round(tickMs / 1000)}s 一 tick，批 ${Number(q.batch) || BATCH}，并发 ${Number(q.concurrency) > 0 ? Number(q.concurrency) : '自适应'}`);
   };
 
