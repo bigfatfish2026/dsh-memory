@@ -22,6 +22,7 @@ import {
   claimObserveTasks,
   completeObserveTask,
   failObserveTask,
+  OBSERVE_SKIP_ERROR,
 } from '../lib/store/observe-queue.js';
 
 /** 临时库 + 迁移脚本建表，和 test/queue-channel.test.mjs 的建库方式一致。 */
@@ -256,5 +257,80 @@ test('外层事务里可安全调用：多次 enqueue 只涨 version，不产生
   const row = rowOf(db, '树莓派');
   assert.equal(Number(row.version), 2);
   assert.equal(String(row.status), 'leased');
+  db.close();
+});
+
+/** 最小 entities 表：只给 claim 侧过滤要读的列（真实表列更多，这里不需要）。 */
+function entitiesDb() {
+  const db = freshDb();
+  db.exec(`CREATE TABLE entities (
+    id INTEGER PRIMARY KEY, norm TEXT NOT NULL UNIQUE,
+    display TEXT NOT NULL DEFAULT '', etype TEXT NOT NULL DEFAULT 'unknown');`);
+  return db;
+}
+
+function putEntity(db, norm, etype) {
+  db.prepare('INSERT INTO entities(norm, display, etype) VALUES (?, ?, ?)').run(norm, norm, etype);
+}
+
+test('claim 跳过 file/config/tool/unknown 实体，person 与查不到实体的行照旧领走', () => {
+  const db = entitiesDb();
+  putEntity(db, '脚本文件', 'file');
+  putEntity(db, '配置项', 'config');
+  putEntity(db, '工具甲', 'tool');
+  putEntity(db, '某未知', 'unknown');
+  putEntity(db, '空类型', '');
+  // 阿甲/谜 没有 entities 行；空类型 etype 为空串：都不许当脏行
+  enqueueObserveTask(db, '阿甲', { now: 100 });
+  enqueueObserveTask(db, '脚本文件', { now: 200 });
+  enqueueObserveTask(db, '配置项', { now: 300 });
+  enqueueObserveTask(db, '工具甲', { now: 400 });
+  enqueueObserveTask(db, '某未知', { now: 500 });
+  enqueueObserveTask(db, '谜', { now: 600 });
+  enqueueObserveTask(db, '空类型', { now: 700 });
+
+  const logs = [];
+  const claimed = claimObserveTasks(db, { limit: 10, owner: 'w1', leaseMs: 60000, now: 1000, log: (l) => logs.push(l) });
+  assert.deepEqual(claimed.map((x) => x.entityKey), ['阿甲', '谜', '空类型'], '只有真实体与不知道类型的行被领走');
+
+  for (const key of ['脚本文件', '配置项', '工具甲', '某未知']) {
+    const row = rowOf(db, key);
+    assert.equal(String(row.status), 'done', `${key} 置 done，不再留在 pending`);
+    assert.equal(String(row.last_error), OBSERVE_SKIP_ERROR, `${key} 留可 grep 的跳过文案`);
+    assert.equal(Number(row.version), 1, `${key} 跳过不涨 version（后续 enqueue 仍能重新判定）`);
+    assert.equal(Number(row.tries), 0, `${key} 跳过不记失败账`);
+    assert.equal(String(row.lease_owner), '', `${key} 不留租约`);
+    assert.equal(Number(row.lease_until), 0);
+    assert.equal(Number(row.updated_ts), 1000, `${key} updated_ts 记跳过时刻`);
+  }
+  assert.equal(String(rowOf(db, '阿甲').status), 'leased', 'person 实体照常领取');
+  assert.equal(String(rowOf(db, '谜').status), 'leased', '查不到 entities 行照常领取');
+  assert.equal(String(rowOf(db, '空类型').status), 'leased', 'etype 为空照常领取');
+  assert.equal(logs.filter((l) => l.startsWith('[observe] 领活跳过非实体类')).length, 4, '四类各打一行跳过日志');
+  db.close();
+});
+
+test('跳过的行不会被下一轮反复 claim；重新 enqueue 才会再判一次', () => {
+  const db = entitiesDb();
+  putEntity(db, '脚本文件', 'file');
+  enqueueObserveTask(db, '脚本文件', { now: 100 });
+  assert.deepEqual(claimObserveTasks(db, { limit: 5, owner: 'w1', now: 200 }), []);
+  const skipped = rowOf(db, '脚本文件');
+  assert.equal(String(skipped.status), 'done');
+  assert.equal(Number(skipped.updated_ts), 200);
+
+  // 同一轮/下一轮再领：done 不在候选里，行一个字节不动
+  assert.deepEqual(claimObserveTasks(db, { limit: 5, owner: 'w2', now: 300 }), []);
+  assert.deepEqual(rowOf(db, '脚本文件'), skipped, '再次 claim 不许改跳过行');
+
+  // 重新登记（别的入口又写进来）→ version+1 回 pending，再领仍被跳过
+  const again = enqueueObserveTask(db, '脚本文件', { reason: 'text_update', now: 400 });
+  assert.equal(again.version, 2);
+  assert.equal(String(rowOf(db, '脚本文件').status), 'pending');
+  assert.deepEqual(claimObserveTasks(db, { limit: 5, owner: 'w3', now: 500 }), []);
+  const reSkipped = rowOf(db, '脚本文件');
+  assert.equal(String(reSkipped.status), 'done');
+  assert.equal(Number(reSkipped.version), 2, '跳过不涨 version');
+  assert.equal(String(reSkipped.last_error), OBSERVE_SKIP_ERROR);
   db.close();
 });

@@ -12,6 +12,16 @@
  * 版本防旧结果：claim 返回领取后的 version，complete/fail 都带 version 条件；
  * 期间只要有人 enqueue（证据变了）或租约过期被别人重领，version 就变，旧结果落不进去、
  * 也不会把新任务标 done。complete/fail 传了 owner 时再校验 lease_owner，双保险。
+ *
+ * 领活侧防御（2026-11-22，t-mwr4i2td-7n7n）：写侧只挡自己的登记，历史脏行或别的入口
+ * 写进来的 file/config/tool/unknown 实体照样会被领走、白烧模型调用。claim 领到候选后按
+ * entity_key ≈ entities.norm 查 etype（复用 entityEtypeOf），命中 SKIP_OBSERVE_ETYPES 的行
+ * 不返回，就地 CAS 置 done + last_error='skipped:non-entity-etype'：不删行、不涨 version、
+ * 不动 tries。用 done 而不是新状态，是因为状态机只有 pending/leased/done 三态，新增状态会给
+ * 所有按 done/pending 统计的读取方带进未知值；done + last_error 是既有字段，complete/fail
+ * 的 WHERE 只认 leased，不会误清。之后若有人重新 enqueue，version+1 把行拉回 pending，
+ * 再被跳过一次（轻量查表，不调模型）。查不到实体行、etype 为空一律放行：和写侧同一口径，
+ * 「不知道类型」不当脏键。
  */
 import type { DatabaseSync } from 'node:sqlite';
 
@@ -21,6 +31,17 @@ export const OBSERVE_LEASE_MS = 10 * 60 * 1000;
 export const OBSERVE_BATCH = 20;
 /** 失败回队列时 last_error 只留前 500 字，和 pending_ops 一个口径。 */
 const LAST_ERROR_MAX = 500;
+
+/**
+ * 不该排队的实体类：文件 / 配置 / 工具 / 未知。
+ *
+ * 单一来源在本文件：写侧 observe-notify.ts 从这里 import（并按原路径 re-export），
+ * 领活侧 claimObserveTasks 用同一份判定，两处不许各写一份清单。
+ */
+export const SKIP_OBSERVE_ETYPES: ReadonlySet<string> = new Set(['file', 'config', 'tool', 'unknown']);
+
+/** claim 跳过非实体类行时写进 last_error 的固定文案，排障按它 grep。 */
+export const OBSERVE_SKIP_ERROR = 'skipped:non-entity-etype';
 
 export type ObserveStatus = 'pending' | 'leased' | 'done';
 
@@ -50,6 +71,8 @@ export interface ClaimObserveOptions {
   owner?: string;
   leaseMs?: number;
   now?: number;
+  /** 跳过非实体类行时的日志出口；不传就静默。 */
+  log?: (line: string) => void;
 }
 
 /** 领到手的一项：version 必须原样带回 complete/fail。 */
@@ -78,6 +101,25 @@ export function hasObserveTaskTable(db: DatabaseSync | null | undefined): boolea
     return Boolean(db.prepare("SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name='observe_task'").get());
   } catch {
     return false;
+  }
+}
+
+/**
+ * 该实体键在 entities 表里的 etype（小写）。
+ *
+ * 缺 entities 表、查不到行、etype 为空/异常一律返回空串：调用方按「不知道类型」放行，
+ * 不因为旧库没跑实体迁移就把登记 / 领活整段关掉。写侧与 claim 侧共用这一处查询。
+ */
+export function entityEtypeOf(db: DatabaseSync | null | undefined, key: unknown): string {
+  const norm = String(key ?? '').trim();
+  if (!db || !norm) return '';
+  try {
+    const row = db.prepare('SELECT etype FROM entities WHERE norm = ?').get(norm) as
+      | { etype?: unknown }
+      | undefined;
+    return String(row?.etype ?? '').trim().toLowerCase();
+  } catch {
+    return '';
   }
 }
 
@@ -148,16 +190,22 @@ export function enqueueObserveTask(
  * 过期重领（原来是 leased）同时让 version+1：旧 owner 手里那一版立即失效，
  * 迟到 complete/fail 的版本条件不再命中。pending 首次领取不涨 version。
  * 返回的 version 是领取后行上的版本（重领时已加过 1），必须原样带回 complete/fail。
+ *
+ * 领到候选后先查 entities.etype：命中 SKIP_OBSERVE_ETYPES 的行不返回，也不留在 pending，
+ * 带同样的 version + 「pending 或已过期」条件 CAS 置 done、last_error='skipped:non-entity-etype'；
+ * 不删行、不涨 version、不动 tries，CAS 没改到说明并发改了行，交给下一轮。
+ * 查不到实体行 / etype 为空照旧领取（entityEtypeOf 返回空串）。
  */
 export function claimObserveTasks(
   db: DatabaseSync | null | undefined,
-  { limit = OBSERVE_BATCH, owner = '', leaseMs = OBSERVE_LEASE_MS, now = Date.now() }: ClaimObserveOptions = {},
+  { limit = OBSERVE_BATCH, owner = '', leaseMs = OBSERVE_LEASE_MS, now = Date.now(), log }: ClaimObserveOptions = {},
 ): ObserveClaim[] {
   if (!db || !hasObserveTaskTable(db)) return [];
   const cap = Math.max(1, toInt(limit, OBSERVE_BATCH));
   const lease = Math.max(1000, toInt(leaseMs, OBSERVE_LEASE_MS));
   const at = toInt(now, Date.now());
   const ownerText = String(owner ?? '');
+  const logLine = typeof log === 'function' ? log : null;
   const rows = db.prepare(
     `SELECT entity_key, entity_id, status, version, reason, tries
        FROM observe_task
@@ -173,6 +221,13 @@ export function claimObserveTasks(
     tries?: unknown;
   }>;
   if (!rows.length) return [];
+  // 跳过非实体类：就地置 done 留痕，不删行、不涨 version（后续 enqueue 仍能把它拉回 pending）
+  const skip = db.prepare(
+    `UPDATE observe_task
+        SET status = 'done', lease_owner = '', lease_until = 0, updated_ts = ?, last_error = ?
+      WHERE entity_key = ? AND version = ?
+        AND (status = 'pending' OR (status = 'leased' AND lease_until < ?))`,
+  );
   // SET 里的表达式都按旧行求值：过期重领的 version+1，pending 首次领取保持原值
   const update = db.prepare(
     `UPDATE observe_task
@@ -185,6 +240,14 @@ export function claimObserveTasks(
   for (const row of rows) {
     const entityKey = String(row.entity_key ?? '');
     const version = toInt(row.version, 0);
+    const etype = entityEtypeOf(db, entityKey);
+    if (SKIP_OBSERVE_ETYPES.has(etype)) {
+      const marked = skip.run(at, OBSERVE_SKIP_ERROR, entityKey, version, at);
+      if (Number(marked.changes) > 0) {
+        logLine?.(`[observe] 领活跳过非实体类 key=${entityKey} etype=${etype} version=${version}`);
+      }
+      continue;
+    }
     const res = update.run(ownerText, at + lease, at, entityKey, version, at);
     if (Number(res.changes) > 0) {
       // 候选取到的 status 与 CAS 修改的是同一行同一版本：leased 的都已涨到 version+1

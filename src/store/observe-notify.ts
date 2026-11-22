@@ -10,6 +10,8 @@
  * 第三条（2026-11-22，t-mwr37s99-7y32）：登记前按 entities.etype 收口，file / config / tool /
  * unknown 四类不排队（它们本来就不是 observation 的主体，占着队列 2/3）；缺 entities 表、
  * 查不到行、etype 空一律照旧放行，不把「不知道类型」当脏键。
+ * 这份常量与查询自 t-mwr4i2td-7n7n 起收口在 observe-queue.ts（claim 侧用同一份），
+ * 本文件只 import 并按原路径 re-export，写侧判断不变。
  *
  * entity_key 口径直接用 shared/entity-normalize 的 normalizeEntity().norm：
  * NFKC 全半角 + 小写 + 空白折叠 + 中文旁空格删除 + 去尾标点 + 去包裹引号/书名号，
@@ -18,7 +20,12 @@
  */
 import type { DatabaseSync } from 'node:sqlite';
 import { normalizeEntity } from '../shared/entity-normalize.js';
-import { enqueueObserveTask, hasObserveTaskTable } from './observe-queue.js';
+import {
+  entityEtypeOf, enqueueObserveTask, hasObserveTaskTable, SKIP_OBSERVE_ETYPES,
+} from './observe-queue.js';
+
+// 这两个符号的实现在 observe-queue.ts（写侧与 claim 侧共用一份）；按原路径继续对外导出。
+export { entityEtypeOf, SKIP_OBSERVE_ETYPES };
 
 /** 只读这几个键的配置面：插件 cfg 与 store cfg 都按结构兼容。 */
 export interface ObserveSwitchConfig {
@@ -84,28 +91,6 @@ export function entityKeyOfId(db: DatabaseSync | null | undefined, entityId: unk
   try {
     const row = db.prepare('SELECT norm FROM entities WHERE id = ?').get(id) as { norm?: unknown } | undefined;
     return normalizeEntity(String(row?.norm ?? '')).norm;
-  } catch {
-    return '';
-  }
-}
-
-/** 登记端不排队的实体类：文件 / 配置 / 工具 / 未知。 */
-export const SKIP_OBSERVE_ETYPES: ReadonlySet<string> = new Set(['file', 'config', 'tool', 'unknown']);
-
-/**
- * 该实体键在 entities 表里的 etype（小写）。
- *
- * 缺 entities 表、查不到行、etype 为空/异常一律返回空串：调用方按「不知道类型」放行，
- * 不因为旧库没跑实体迁移就把登记整段关掉。
- */
-export function entityEtypeOf(db: DatabaseSync | null | undefined, key: unknown): string {
-  const norm = String(key ?? '').trim();
-  if (!db || !norm) return '';
-  try {
-    const row = db.prepare('SELECT etype FROM entities WHERE norm = ?').get(norm) as
-      | { etype?: unknown }
-      | undefined;
-    return String(row?.etype ?? '').trim().toLowerCase();
   } catch {
     return '';
   }

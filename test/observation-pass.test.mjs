@@ -60,7 +60,9 @@ CREATE TABLE entity_issue (
   memory_id TEXT NOT NULL DEFAULT '', entity_norm TEXT NOT NULL, raw_name TEXT NOT NULL DEFAULT '',
   reason TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
   PRIMARY KEY (memory_id, entity_norm, reason)) WITHOUT ROWID;
-INSERT INTO entities(id, norm, display) VALUES (1, '树莓派', '树莓派'), (2, 'alpha', 'Alpha'), (3, 'beta', 'Beta');
+-- claim 侧按 entities.etype 收口（t-mwr4i2td-7n7n）：夹具直接插实体、绕过写侧登记，
+-- 这里必须给真实 etype；默认 'unknown' 会被 claim 当非实体类跳过。
+INSERT INTO entities(id, norm, display, etype) VALUES (1, '树莓派', '树莓派', 'device'), (2, 'alpha', 'Alpha', 'person'), (3, 'beta', 'Beta', 'person');
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 INSERT INTO meta(key, value) VALUES ('dim', '4');
 `;

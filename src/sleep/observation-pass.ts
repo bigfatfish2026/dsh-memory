@@ -46,7 +46,8 @@ import {
   independentSourceCount, selectEntityEvidence, sourceRootsOf,
 } from './observation-sources.js';
 import {
-  claimObserveTasks, completeObserveTask, failObserveTask, hasObserveTaskTable, OBSERVE_LEASE_MS,
+  claimObserveTasks, completeObserveTask, entityEtypeOf, failObserveTask, hasObserveTaskTable,
+  OBSERVE_LEASE_MS, SKIP_OBSERVE_ETYPES,
 } from '../store/observe-queue.js';
 import { bumpObservationEpoch, observationEvidence } from '../store/observation-records.js';
 import { entityKeysOf } from '../store/observe-notify.js';
@@ -147,7 +148,12 @@ function observeCfgOf(cfg: SleepCfg): ObservationCfg {
   return raw && typeof raw === 'object' ? raw as ObservationCfg : {};
 }
 
-/** dryRun 的只读候选：WHERE / ORDER 与 claimObserveTasks 完全一致，但不写状态。 */
+/**
+ * dryRun 的只读候选：WHERE / ORDER 与 claimObserveTasks 完全一致，但不写状态。
+ *
+ * 非实体类（file/config/tool/unknown）按与 claim 相同的口径滤掉；dryRun 不写状态，
+ * 所以这些脏行本轮只是不出现，等实跑那一轮才由 claim 标 done，期间仍占候选窗口。
+ */
 function peekObserveTasks(db: DatabaseSync, limit: number, now: number): ObserveTask[] {
   const rows = db.prepare(
     `SELECT entity_key, entity_id, version, reason, tries
@@ -162,13 +168,15 @@ function peekObserveTasks(db: DatabaseSync, limit: number, now: number): Observe
     reason?: unknown;
     tries?: unknown;
   }>;
-  return rows.map((row) => ({
-    entityKey: String(row.entity_key ?? ''),
-    entityId: String(row.entity_id ?? ''),
-    version: Math.trunc(Number(row.version) || 0),
-    reason: String(row.reason ?? ''),
-    tries: Math.trunc(Number(row.tries) || 0),
-  }));
+  return rows
+    .filter((row) => !SKIP_OBSERVE_ETYPES.has(entityEtypeOf(db, String(row.entity_key ?? ''))))
+    .map((row) => ({
+      entityKey: String(row.entity_key ?? ''),
+      entityId: String(row.entity_id ?? ''),
+      version: Math.trunc(Number(row.version) || 0),
+      reason: String(row.reason ?? ''),
+      tries: Math.trunc(Number(row.tries) || 0),
+    }));
 }
 
 /** entities.display；查不到退回规范化键。 */
@@ -569,7 +577,7 @@ export async function runObservationPass(
   const owner = String(deps.owner || 'observe-pass');
   const tasks: ObserveTask[] = dryRun
     ? peekObserveTasks(db, limit, now())
-    : claimObserveTasks(db, { limit, owner, leaseMs: deps.leaseMs ?? OBSERVE_LEASE_MS, now: now() });
+    : claimObserveTasks(db, { limit, owner, leaseMs: deps.leaseMs ?? OBSERVE_LEASE_MS, now: now(), log });
 
   const result: ObservationPassResult = {
     processed: 0, created: 0, updated: 0, failed: 0, dryRun, versionMismatch: 0,
