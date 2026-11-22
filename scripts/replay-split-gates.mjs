@@ -15,8 +15,8 @@
  *   3) 统计「拦下」（覆盖闸不通过）与「误杀」（生产上原条已归档、新闸却拦下）。
  * 另外统计待拆 pending/running 的版本不一致条数，并列出「原条 active 但 supersededBy 指向子段」的 id。
  *
- * 用法：node scripts/replay-split-gates.mjs [生产库路径]
- * 默认库：/home/julia/fatfish/memory/memory.db
+ * 用法：node scripts/replay-split-gates.mjs <生产库路径>
+ * 库路径取 argv[2]，没给就读 DSH_MEMORY_DB；两处都没有直接报错退出。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -24,7 +24,11 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { verifySplitCoverage } from '../lib/pipeline-split.js';
 
-const PROD = process.argv[2] || '/home/julia/fatfish/memory/memory.db';
+const PROD = (process.argv[2] || process.env.DSH_MEMORY_DB || '').trim();
+if (!PROD) {
+  console.error('缺少库路径：node scripts/replay-split-gates.mjs <生产库路径>（或设 DSH_MEMORY_DB）');
+  process.exit(2);
+}
 const LIMIT = { no_source: 25, all_parts_deduped: 12, zero_parts: 12 };
 const SCAN_DONE = 2600;
 

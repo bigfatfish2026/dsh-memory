@@ -239,7 +239,7 @@ export function shouldSkipSession({ origin, compactWorker }: { origin?: unknown;
 /**
  * 命中「不发提醒的 provider 名单」就整轮跳过（2026-11-21）。
  *
- * 群会话走独立路由（本机 magpie-grp / group/ds），主人要求群里不要再收到
+ * 群会话走独立路由（本机 magpie-grp / group/ds），用户要求群里不要再收到
  * 「上下文 XXk / 52.4k 压缩线」这类提醒；主会话（magpie）和子会话（按 origin 另行跳过）
  * 行为不变。判据只看 provider：主会话的 model 同样是 group/ds，按 model 前缀分会误伤。
  *

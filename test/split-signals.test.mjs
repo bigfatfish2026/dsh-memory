@@ -26,10 +26,10 @@ import { enqueue } from '../lib/ingest-index.js';
 
 const A = '小林去机房巡检时看了风扇的转速，顺手记下当天的温湿度读数。';
 // 段首指代只在 validateParts 层面测（split 的段落单独过 lint，「它」在段首就是整条首字，本来就拒）。
-const B = '它现在能读到 14551 条记忆，拆分之后一条都不许丢。';
+const B = '它现在能读到 3216 条记忆，拆分之后一条都不许丢。';
 const SOURCE = `${A}${B}`;
 // 走 split()/consumeSplitOps 的样本：命中 split_process 信号，且正文 lint 不拒。
-const PROCESS_B = '本轮工具用不了，拆分没跑完，但库里 14551 条记忆一条都没丢。';
+const PROCESS_B = '本轮工具用不了，拆分没跑完，但库里 3216 条记忆一条都没丢。';
 const SOURCE_PROCESS = `${A}${PROCESS_B}`;
 const SRC_ID = 'm_src';
 
@@ -228,7 +228,7 @@ test('split() 开 signalsStrict：重问一次仍不合格就退拆，日志写�
 // ── ④ text-lint 分级：warn 只记、reject 照旧 ───────────────────
 
 test('text-lint：分句首单字指代只记（warn），不阻断', () => {
-  const result = lintMemoryText('用户把 dsh-memory 的 storePath 设成 /home/julia/fatfish/memory/memory.db，它现在能读到 14551 条记忆。');
+  const result = lintMemoryText('用户把 dsh-memory 的 storePath 设成 /home/julia/fatfish/memory/memory.db，它现在能读到 3216 条记忆。');
   assert.equal(result.ok, true, 'warn 级不许让 ok=false');
   const warn = result.violations.find((v) => v.code === 'bare_reference_clause');
   assert.ok(warn, '分句首「它」要记一条 bare_reference_clause');

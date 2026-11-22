@@ -27,14 +27,14 @@
  *   node scripts/migrate-entity-paths.mjs --undo     --db <副本> [--run-id <票号>]
  *   node scripts/migrate-entity-paths.mjs --verify   [--db path] [--run-id x]
  *   node scripts/migrate-entity-paths.mjs --snapshot [--db path] [--run-id x]
- * --apply / --undo 默认拒绝写生产库（DEFAULT_DB_PATH），要写必须再给 --allow-prod。
+ * --apply / --undo 默认拒绝写生产库（DEFAULT_DB_PATH 或 DSH_MEMORY_DB 指的库），要写必须再给 --allow-prod。
  * --dry-run / --verify / --snapshot 只读开库。
  */
 import { backup } from 'node:sqlite';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { openDb, DEFAULT_DB_PATH, resolveMemoryFile } from './lib/db.mjs';
+import { openDb, DEFAULT_DB_PATH, resolveDbPath, resolveMemoryFile } from './lib/db.mjs';
 import {
   PATH_SURFACE_SOURCE, SURFACE_SOURCES, requireTables, classifyByPathEvidence,
   surfaceOccurrences, applyBatch, undoBatch, markReviewOnly, nowIso,
@@ -50,17 +50,16 @@ const MODE = flag('--apply') ? 'apply'
   : flag('--undo') ? 'undo'
     : flag('--verify') ? 'verify'
       : flag('--snapshot') ? 'snapshot' : 'dry-run';
-const DB = path.resolve(opt('--db') || DEFAULT_DB_PATH);
+const DB = path.resolve(opt('--db') || resolveDbPath());
 const RUN_ID = opt('--run-id') || DEFAULT_RUN_ID;
 const BACKUP_PATH = path.resolve(opt('--backup') || (DB === DEFAULT_DB_PATH
   ? resolveMemoryFile(`backup/memory-before-pathmigrate-${RUN_ID}.db`)
   : `${DB}.before-pathmigrate.db`));
 
-/** 生产库清单：跟 cwd 走的默认库 + 这台机器上插件实际在用的库（见 AGENTS.md 末节）。 */
+/** 生产库清单：跟 cwd 走的默认库 + DSH_MEMORY_DB 指的库；不写死任何本机路径。 */
 const PROD_DBS = new Set([
   path.resolve(DEFAULT_DB_PATH),
-  '/home/julia/fatfish/memory/memory.db',
-  '/home/julia/memory/memory.db',
+  path.resolve(resolveDbPath()),
 ]);
 
 function assertWritableTarget() {

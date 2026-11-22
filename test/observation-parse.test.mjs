@@ -43,7 +43,7 @@ function ctx(over = {}) {
 function op(over = {}) {
   return {
     op: 'create',
-    text: '小鱼住在树莓派里，负责夜间整理长期记忆。',
+    text: '夜间整理按实体聚合证据，生成一条新的观察记录。',
     evidence: ['a', 'b'],
     ...over,
   };

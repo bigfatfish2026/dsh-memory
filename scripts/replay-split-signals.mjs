@@ -10,8 +10,8 @@
  *       没有子段的，按句末（。！？换行）切一遍兜底，只为跑判据，不改正文。
  * 判据：lib/agents/split.js 的 splitSignalsOf（阶段一四条信号，纯函数，不写库）。
  *
- * 用法：node scripts/replay-split-signals.mjs [生产库路径] [样本数] [报告文件]
- * 默认库 /home/julia/fatfish/memory/memory.db，样本 100，报告写到 stdout。
+ * 用法：node scripts/replay-split-signals.mjs <生产库路径> [样本数] [报告文件]
+ * 库路径取 argv[2]，没给就读 DSH_MEMORY_DB；样本默认 100，报告写到 stdout。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -19,7 +19,11 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { splitSignalsOf } from '../lib/agents/split.js';
 
-const PROD = process.argv[2] || '/home/julia/fatfish/memory/memory.db';
+const PROD = (process.argv[2] || process.env.DSH_MEMORY_DB || '').trim();
+if (!PROD) {
+  console.error('缺少库路径：node scripts/replay-split-signals.mjs <生产库路径>（或设 DSH_MEMORY_DB）');
+  process.exit(2);
+}
 const WANT = Number(process.argv[3] || 100);
 const OUT = process.argv[4] || '';
 const SCAN = Math.max(WANT * 8, 800);

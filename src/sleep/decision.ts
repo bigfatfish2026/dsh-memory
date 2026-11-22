@@ -4,7 +4,7 @@
  * 入口冲突检查（model-calls.ts 的 runConflictCheck）现在逐条问生成模型：今天实测 359 次，
  * 其中 81.1% 判 new，这些条白白花掉一次几十秒的生成调用。这里把「这条新记忆跟这些同实体
  * 旧条都不冲突、可以直接作为新条入库」交给本地 decision 桥
- * （/home/julia/fatfish/tools/gemini-decision-bridge，默认 127.0.0.1:3427）批量判：
+ * （见 profile 里的 baseUrl，默认 127.0.0.1:3427）批量判：
  * 一批一次请求，高置信判 new 的直接放行，其余退回原来的 askConflict。
  *
  * 桥的硬约束（都实测过）：
