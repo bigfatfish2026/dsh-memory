@@ -16,6 +16,7 @@ import {
   selectPolicy,
   setupContextWatch,
   shouldNotify,
+  shouldSkipProvider,
   shouldSkipSession,
 } from '../lib/context-watch.js';
 
@@ -496,6 +497,16 @@ test('子会话判定：compactWorker 没显式打开就跳过，主会话永远
   assert.equal(shouldSkipSession(), false);
 });
 
+test('provider 跳过名单：群会话路由命中就跳过，主会话同名 model 不误伤', () => {
+  assert.equal(shouldSkipProvider({ provider: 'magpie-grp', skipProviders: ['magpie-grp'] }), true);
+  assert.equal(shouldSkipProvider({ provider: 'magpie', skipProviders: ['magpie-grp'] }), false, '主会话 provider 不同，照发');
+  assert.equal(shouldSkipProvider({ provider: 'Magpie-Grp', skipProviders: ['magpie-grp'] }), false, '口径是精确相等');
+  assert.equal(shouldSkipProvider({ provider: 'magpie-grp', skipProviders: [] }), false, '名单空 = 旧行为');
+  assert.equal(shouldSkipProvider({ provider: 'magpie-grp' }), false);
+  assert.equal(shouldSkipProvider({ provider: undefined, skipProviders: ['magpie-grp'] }), false);
+  assert.equal(shouldSkipProvider(), false);
+});
+
 test('端到端：子会话（header.origin=subagent）在 99% 也不发提醒，主会话同水位照发', async () => {
   const cfg = tempCfg();
   const worker = liveSession({ header: { origin: 'subagent', delegationDepth: 1 } });
@@ -523,6 +534,34 @@ test('端到端：子会话（header.origin=subagent）在 99% 也不发提醒�
   assert.equal(mainCtx.published.length, 1, '主会话 95% 提醒保留');
   assert.equal(mainCtx.published[0].payload.origin, 'main');
   assert.equal(mainCtx.published[0].payload.compactTokens, LINE);
+});
+
+test('端到端：群会话（provider=magpie-grp）在 99% 也不发提醒，主会话同配置照发', async () => {
+  const cfg = tempCfg({ contextWatchSkipProviders: ['magpie-grp'] });
+  fs.writeFileSync(
+    cfg.contextWatchStateFile,
+    JSON.stringify({ sessions: { 'sid-group': { level: 1, notified: true, atTokens: 50000, at: 1794566627421 } } }),
+  );
+  const group = liveSession({
+    requestContext: () => ({ provider: 'magpie-grp', model: 'group/ds', contextWindow: 1048576 }),
+  });
+  const groupCtx = makeCtx({ session: group, pressure: { pressureTokens: 52000, contextWindow: 1048576 } });
+  const groupWatch = setupContextWatch(groupCtx.ctx, cfg);
+  await groupWatch.check({ sessionId: 'sid-group' });
+  await groupWatch.check({ sessionId: 'sid-group' });
+  assert.equal(groupCtx.published.length, 0, '群会话不许收到压缩线提醒');
+  const groupLog = fs.readFileSync(cfg.contextWatchLogFile, 'utf8');
+  assert.match(groupLog, /magpie-grp\/group\/ds 在跳过名单里，不发压线提醒/, '跳过要留一行日志，别静默');
+  assert.equal((groupLog.match(/在跳过名单里/g) || []).length, 1, '同一会话只记一次跳过日志');
+  const state = JSON.parse(fs.readFileSync(cfg.contextWatchStateFile, 'utf8'));
+  assert.equal(state.sessions['sid-group'], undefined, '以前按主会话规则发过的记录要清掉');
+
+  // 同一个 99% 水位换主会话（provider=magpie，model 同样是 group/ds），照旧发一条
+  const mainCtx = makeCtx({ session: liveSession(), pressure: { pressureTokens: NOTIFY_AT, contextWindow: 1048576 } });
+  const mainWatch = setupContextWatch(mainCtx.ctx, cfg);
+  await mainWatch.check({ sessionId: 'sid-main-grp' });
+  assert.equal(mainCtx.published.length, 1, '主会话 95% 提醒保留');
+  assert.equal(mainCtx.published[0].payload.providerModel, 'magpie/group/ds');
 });
 
 test('端到端：子会话以前发过的记录被清掉，不会因compactWorker以后打开而重弹旧水位', async () => {

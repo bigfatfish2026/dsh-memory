@@ -106,6 +106,7 @@ export interface CheckOptions {
 /** 装了属性的 check：跳过/告警只记一次。 */
 export type CheckFn = ((options: CheckOptions) => Promise<void>) & {
   _skippedWorkers?: Set<string>;
+  _skippedProviders?: Set<string>;
   _warnedConfig?: boolean;
 };
 
@@ -233,6 +234,27 @@ export function shouldNotify({ pressureTokens, compactTokens, entry, compactedAt
  */
 export function shouldSkipSession({ origin, compactWorker }: { origin?: unknown; compactWorker?: unknown } = {}): boolean {
   return origin === 'worker' && compactWorker !== true;
+}
+
+/**
+ * 命中「不发提醒的 provider 名单」就整轮跳过（2026-11-21）。
+ *
+ * 群会话走独立路由（本机 magpie-grp / group/ds），主人要求群里不要再收到
+ * 「上下文 XXk / 52.4k 压缩线」这类提醒；主会话（magpie）和子会话（按 origin 另行跳过）
+ * 行为不变。判据只看 provider：主会话的 model 同样是 group/ds，按 model 前缀分会误伤。
+ *
+ * 名单为空（默认）时恒为 false，等于旧行为；匹配口径跟 selectPolicy 一致——精确相等、
+ * 区分大小写。
+ *
+ * @param {object} input - 判定输入。
+ * @param {string} input.provider - 会话当前路由 provider（check 里取自 session.requestContext()）。
+ * @param {string[]} [input.skipProviders] - 配置 contextWatchSkipProviders。
+ * @returns {boolean} true = 这一轮不算线也不发提醒。
+ */
+export function shouldSkipProvider({ provider, skipProviders }: { provider?: unknown; skipProviders?: unknown } = {}): boolean {
+  const name = String(provider || '');
+  if (!name || !Array.isArray(skipProviders)) return false;
+  return skipProviders.some((item) => String(item) === name);
 }
 
 /**
@@ -510,6 +532,20 @@ export function setupContextWatch(ctx: ContextWatchCtx, cfg: Record<string, unkn
 
     const provider = route.provider || options.provider || '';
     const model = route.model || options.model || '';
+    // 名单里的 provider（本机是群会话的 magpie-grp）整轮跳过：群里不发压线提醒。
+    // 以前按主会话规则发过的记录顺手清掉，别留着以后挡回提醒（同子会话分支口径）。
+    if (shouldSkipProvider({ provider, skipProviders: cfg.contextWatchSkipProviders })) {
+      if (state.sessions[sessionId]) {
+        forget(state, sessionId);
+        saveState(stateFile, state);
+      }
+      if (!(check as CheckFn)._skippedProviders) (check as CheckFn)._skippedProviders = new Set();
+      if (!(check as CheckFn)._skippedProviders!.has(sessionId)) {
+        (check as CheckFn)._skippedProviders!.add(sessionId);
+        log(`会话路由 ${provider}/${model} 在跳过名单里，不发压线提醒`);
+      }
+      return;
+    }
     const compaction = (() => {
       try {
         return ctx.get!('compaction')?.config;
