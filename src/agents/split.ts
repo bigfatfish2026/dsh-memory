@@ -66,7 +66,19 @@ export interface SplitPart {
   text: string;
   evidence: string;
   keptFacts: unknown[];
+  /** 在原文（trim 后）里的区间 [start,end)；validateParts 之后必有。 */
+  start?: number;
+  end?: number;
   [key: string]: unknown;
+}
+
+/** 段级自足性信号（2026-11-20 P0 阶段一）：只记不拒，code 固定四种。 */
+export interface SplitSignal {
+  code: 'split_delimiter' | 'split_deictic' | 'split_premise' | 'split_process';
+  /** 命中的段下标（parts 里的位置）。 */
+  index: number;
+  /** 给人看的一行：判据 + 段首 30 字。 */
+  hint: string;
 }
 
 /** validateParts 的结果：通过时带段与字数账，失败时带原因。 */
@@ -82,6 +94,8 @@ export interface ValidatePartsResult {
   longKept?: number;
   unavoidable?: boolean;
   lostFacts?: string[];
+  /** 段级信号：阶段一只记录，ok 不受影响；signalsStrict 打开时才会拒。 */
+  signals?: SplitSignal[];
 }
 
 /** 模型流的一块：只认下面这些字段。 */
@@ -192,6 +206,8 @@ export interface SplitOptions {
   textLint?: boolean;
   lintReview?: boolean;
   lintReviewTimeoutMs?: number;
+  /** 阶段二开关（pipeline.splitSignalsStrict，默认 false）：打开才把段级信号当硬拒。 */
+  signalsStrict?: boolean;
 }
 
 /** split() 的产物：通过校验的段与字数账。 */
@@ -206,8 +222,15 @@ export interface SplitResult {
   charsBefore?: number;
   charsAfter?: number;
   longKept?: number;
+  /** 最终布局的切点（parts[i+1].start），二次切分与 lint 重做之后的位置。 */
   cuts?: number[];
   lintRejected?: number;
+  /** 被正文 lint 剔掉、不再入库的段（覆盖校验用）。 */
+  lintDiscards?: SplitPart[];
+  /** 被判重丢掉、不再入库的段（覆盖校验用）。 */
+  dedupeDiscards?: SplitPart[];
+  /** 段级自足性信号（阶段一只记，供回放统计；signalsStrict 打开时命中即判废）。 */
+  signals?: SplitSignal[];
 }
 
 export const SPLIT_SYSTEM = `你是记忆切分员。给你一条超长记忆，你只给切分点，正文由程序照原文切。
@@ -216,11 +239,13 @@ export const SPLIT_SYSTEM = `你是记忆切分员。给你一条超长记忆，
 1. 只给切分点，不许改写、不许扩写、不许补字、不许输出任何正文。程序会按你的切分点从原文
    slice，你写的字除了定位串以外一个都用不上。
 2. cuts 每项是原文里连续 8-20 字，必须在上一个切点之后唯一能找到（逐字抄，别改标点）。
-3. 第一段从原文开头算，不用给它的锚；最后一段到原文结尾，不用给。所以 cuts 至少一项。
+3. 第一段从原文开头算，不用给它的锚；最后一段到原文结尾，不用给；正常拆分时 cuts 至少一项。
 4. 别切太碎：一段尽量 30~200 字。切粗了程序会按句号/换行再切，不算错；切碎了会退拆。
-5. 每段的边界尽量落在句号、换行之后，别插在句子中间。
-6. 200 字内确实装不下（比如强依赖上下文的推理），输出 unavoidable=true 加理由，不要硬切。
-7. 只输出 JSON。
+5. 每段的边界只许落在句号、换行之后；不许落在分号之后，不许插在句子中间；不许切在引号、括号、代码围栏内部。
+6. 每段单独拿出来，必须能看出对象和完整的动作或结论。否定、条件和结论要留在同一段。需要补字、借用上一段主语或跨段补括号时，换切点或把相邻段并起来。仍然拆不开就输出 {"cuts":[],"unavoidable":true,"reason":"一句话说明原因"}。空 cuts 不能配 unavoidable:false。
+7. 每段不许以这些词开头：这、该、它、此、那、上述、上面、这份、本文件、该目录、这个仓库、这个插件；要写成本段真正的对象。
+8. 纯过程性状态（本轮、本轮工具不可用、这次失败）不是记忆，不要切出来；整条都是这种就输出 unavoidable=true 并写明理由。
+9. 只输出 JSON。
 
 ${SELF_CONTAINED_RULES}
 
@@ -229,7 +254,10 @@ ${SPLIT_RULES}`;
 export const SPLIT_USER_TEMPLATE = `原条目 {id}（{type}，{ts}）：{text}
 
 输出（只给切分点，不给正文）
-{"cuts":["原文里第二段开头的 8-20 字","原文里第三段开头的 8-20 字"],"unavoidable":false,"reason":""}`;
+{"cuts":["原文里第二段开头的 8-20 字","原文里第三段开头的 8-20 字"],"unavoidable":false,"reason":""}
+
+可拆：两段各有对象和结论，切点在句号之后 → {"cuts":["第二段开头的原文 8-20 字"],"unavoidable":false,"reason":""}
+不可拆：否定、条件或结论被切断就读不懂，换切点也补不回来 → {"cuts":[],"unavoidable":true,"reason":"条件与结论不可分"}`;
 
 /** 工具通道的 schema：顶层 {cuts,offsets,unavoidable,reason}，字段固定，别让模型自由发挥。 */
 export const SUBMIT_PARTS_TOOL = {
@@ -271,6 +299,113 @@ const SOFT_MARKS = ['，', '、', '：', ',', ';', ' '];
 
 function fail(reason: string, extra: Record<string, unknown> = {}): ValidatePartsResult {
   return { ok: false, reason, ...extra };
+}
+
+/** 段首指代词表（split 段级口径；不动 SELF_CONTAINED_RULES 的措辞）。 */
+export const SPLIT_DEICTIC_OPENERS = [
+  '这', '该', '它', '此', '那', '上述', '上面', '这份', '本文件', '该目录', '这个仓库', '这个插件',
+];
+
+/** 缺前提的结论式段首：只有结论没有「因为/由于/…」的段落。 */
+const PREMISE_LEADS = ['改法', '做法', '结论', '思路', '原因', '建议'];
+/** 前提标记：段内出现任一个就算说明了前提。 */
+const PREMISE_MARKS = ['因为', '由于', '前提', '基于', '原文'];
+/** 「在…下」形状的限定条件也算前提。 */
+const PREMISE_UNDER_RE = /在[^，。；！？\n]{0,24}下/;
+
+/** 过程性状态：本轮/这次 + 用不了/不可用/失败 这类不成记忆的段落。 */
+const PROCESS_STATE_RE = /(本轮|这次|这一轮)/;
+const PROCESS_STATE_BAD_RE = /(用不了|不可用|失败|无法|不能)/;
+
+/** 每一段开头都截同样的长度进 hint，方便日志与人工判读对齐。 */
+const SIGNAL_HEAD = 30;
+
+function headOf(text: string): string {
+  return String(text ?? '').trim().slice(0, SIGNAL_HEAD);
+}
+
+function countOf(text: string, needle: string): number {
+  let n = 0;
+  let at = 0;
+  while ((at = text.indexOf(needle, at)) !== -1) {
+    n += 1;
+    at += needle.length;
+  }
+  return n;
+}
+
+const DELIMITER_PAIRS: Array<[string, string]> = [
+  ['「', '」'], ['『', '』'], ['“', '”'], ['（', '）'], ['(', ')'],
+];
+
+/**
+ * 定界符配平（2026-11-20 P0 阶段一信号）：每段内引号、括号成对，代码围栏出现偶数次。
+ * 只看段正文，不看 offsets；命中只记 code，不判废。
+ */
+export function delimiterBalance(parts: Array<{ text: string }>): SplitSignal[] {
+  const out: SplitSignal[] = [];
+  (Array.isArray(parts) ? parts : []).forEach((part, index) => {
+    const text = String(part?.text ?? '');
+    const broken: string[] = [];
+    for (const [open, close] of DELIMITER_PAIRS) {
+      if (countOf(text, open) !== countOf(text, close)) broken.push(`${open}${close}`);
+    }
+    if (countOf(text, '```') % 2 !== 0) broken.push('```');
+    // 直双引号没有配对字符：出现奇数次就算破
+    if (countOf(text, '"') % 2 !== 0) broken.push('"');
+    if (!broken.length) return;
+    out.push({ code: 'split_delimiter', index, hint: `定界符不配平（${broken.join(' ')}）：${headOf(text)}` });
+  });
+  return out;
+}
+
+/** 段首指代：trim 后前 4 字命中词表，就算离开上文读不懂。 */
+export function deicticOpeners(parts: Array<{ text: string }>): SplitSignal[] {
+  const out: SplitSignal[] = [];
+  (Array.isArray(parts) ? parts : []).forEach((part, index) => {
+    const text = String(part?.text ?? '');
+    const head = text.trim().slice(0, 4);
+    const hit = SPLIT_DEICTIC_OPENERS.find((word) => head.startsWith(word));
+    if (!hit) return;
+    out.push({ code: 'split_deictic', index, hint: `段首指代「${hit}」：${headOf(text)}` });
+  });
+  return out;
+}
+
+/** 缺前提：段首是改法/做法/结论/思路/原因/建议，且段内没有前提标记。 */
+export function missingPremise(parts: Array<{ text: string }>): SplitSignal[] {
+  const out: SplitSignal[] = [];
+  (Array.isArray(parts) ? parts : []).forEach((part, index) => {
+    const text = String(part?.text ?? '');
+    const head = text.trim().slice(0, 6);
+    const lead = PREMISE_LEADS.find((word) => head.startsWith(word));
+    if (!lead) return;
+    const premised = PREMISE_MARKS.some((mark) => text.includes(mark)) || PREMISE_UNDER_RE.test(text);
+    if (premised) return;
+    out.push({ code: 'split_premise', index, hint: `段首「${lead}」没有前提：${headOf(text)}` });
+  });
+  return out;
+}
+
+/** 过程性状态：本轮/这次 + 用不了/不可用/失败，这种段不是记忆。 */
+export function processState(parts: Array<{ text: string }>): SplitSignal[] {
+  const out: SplitSignal[] = [];
+  (Array.isArray(parts) ? parts : []).forEach((part, index) => {
+    const text = String(part?.text ?? '');
+    if (!PROCESS_STATE_RE.test(text) || !PROCESS_STATE_BAD_RE.test(text)) return;
+    out.push({ code: 'split_process', index, hint: `过程性状态：${headOf(text)}` });
+  });
+  return out;
+}
+
+/** 四条段级信号一起收：按段下标排序，同一段可命中多条。 */
+export function splitSignalsOf(parts: Array<{ text: string }>): SplitSignal[] {
+  return [
+    ...delimiterBalance(parts),
+    ...deicticOpeners(parts),
+    ...missingPremise(parts),
+    ...processState(parts),
+  ].sort((a, b) => a.index - b.index);
 }
 
 /** 去掉所有空白后的字符序列：段界空白允许被 trim 掉，字一个都不许丢。 */
@@ -426,7 +561,11 @@ export function splitLongPart(text: unknown, maxChars = PART_TEXT_MAX): Array<{ 
  *            ratio?:number, charsBefore?:number, charsAfter?:number, longKept?:number,
  *            unavoidable?:boolean, lostFacts?:string[]}}
  */
-export function validateParts(answer: SplitCutsInput | null | undefined, sourceText: unknown, opts: { maxChars?: number } = {}): ValidatePartsResult {
+export function validateParts(
+  answer: SplitCutsInput | null | undefined,
+  sourceText: unknown,
+  opts: { maxChars?: number; signalsStrict?: boolean } = {},
+): ValidatePartsResult {
   const maxChars = Number(opts.maxChars) > 0 ? Number(opts.maxChars) : PART_TEXT_MAX;
   const source = String(sourceText ?? '').trim();
   const unavoidable = answer?.unavoidable === true;
@@ -452,30 +591,38 @@ export function validateParts(answer: SplitCutsInput | null | undefined, sourceT
     });
   }
 
-  // 超长段由代码按句读再切（不问模型）；切不动的整段保留，记 longKept
-  const pieces = [];
+  // 超长段由代码按句读再切（不问模型）；切不动的整段保留，记 longKept。
+  // 二次切分后的每个子片都要带原文区间，切点账按**最终布局**算，不再沿用首轮 offsets。
+  const pieces: Array<{ text: string; start: number; end: number; longKept?: boolean }> = [];
   let longKept = 0;
+  let at = 0;
   for (const piece of raw) {
+    const from = at;
+    at += piece.length;
     if (piece.length <= maxChars) {
-      pieces.push(piece);
+      pieces.push({ text: piece, start: from, end: at });
       continue;
     }
     const sliced = splitLongPart(piece, maxChars);
-    for (const sub of sliced) {
-      if (sub.longKept) longKept += 1;
-      pieces.push(sub.text);
-    }
     if (sliced.map((sub) => sub.text).join('') !== piece) {
       return fail('splice_mismatch', { hint: '超长段按句读再切后拼不回该段原文，切点错位' });
+    }
+    let cursor = from;
+    for (const sub of sliced) {
+      if (sub.longKept) longKept += 1;
+      pieces.push({ text: sub.text, start: cursor, end: cursor + sub.text.length, longKept: sub.longKept });
+      cursor += sub.text.length;
     }
   }
 
   // 第二道网：段界空白允许 trim，但字一个都不许丢、不许重复
-  const parts = [];
+  const parts: SplitPart[] = [];
   for (const piece of pieces) {
-    const text = piece.trim();
+    const text = piece.text.trim();
     if (!text) continue;
-    parts.push({ text, evidence: text.slice(0, 24), keptFacts: [] });
+    const lead = piece.text.length - piece.text.trimStart().length;
+    const start = piece.start + lead;
+    parts.push({ text, evidence: text.slice(0, 24), keptFacts: [], start, end: start + text.length });
   }
   const charsBefore = source.length;
   const charsAfter = parts.reduce((sum, part) => sum + part.text.length, 0);
@@ -491,16 +638,28 @@ export function validateParts(answer: SplitCutsInput | null | undefined, sourceT
       hint: '只切出一段，必须至少切两段；锚串要指向第二段的开头',
     });
   }
+  // 段级自足性信号（2026-11-20 P0）：阶段一只记录，ok 不受影响；
+  // signalsStrict（配置 pipeline.splitSignalsStrict，默认 false）打开时才当硬拒。
+  const signals = splitSignalsOf(parts);
+  if (opts.signalsStrict === true && signals.length) {
+    const first = signals[0];
+    return fail(`split_signal:${first.code}`, {
+      signals,
+      hint: `${first.hint}（splitSignalsStrict 打开，段级信号按失败处理）`,
+    });
+  }
   return {
     ok: true,
     parts,
-    offsets: resolved.offsets,
+    // 切点按最终 parts 的起点算：二次切分出的每个子片都有自己的 [start,end)
+    offsets: parts.slice(1).map((part) => Number(part.start)),
     ratio: charsBefore > 0 ? charsAfter / charsBefore : 0,
     charsBefore,
     charsAfter,
     longKept,
     unavoidable: false,
     lostFacts: [],
+    signals,
   };
 }
 
@@ -620,15 +779,42 @@ function sumChars(parts: unknown): number {
   return (Array.isArray(parts) ? parts : []).reduce((sum, part) => sum + String(part?.text ?? '').length, 0);
 }
 
-/** 正文去重：normalizeText 后同一段只留先出现的。 */
-function dedupeParts(parts: unknown): SplitPart[] {
+/** 正文去重：normalizeText 后同一段只留先出现的；丢掉的段一并带回给覆盖校验。 */
+function dedupeParts(parts: unknown): { parts: SplitPart[]; dropped: SplitPart[] } {
   const seen = new Set();
-  return (Array.isArray(parts) ? parts : []).filter((part) => {
+  const kept: SplitPart[] = [];
+  const dropped: SplitPart[] = [];
+  for (const part of (Array.isArray(parts) ? parts : []) as SplitPart[]) {
     const key = normalizeText(part?.text);
-    if (seen.has(key)) return false;
+    if (seen.has(key)) {
+      dropped.push(part);
+      continue;
+    }
     seen.add(key);
-    return true;
-  });
+    kept.push(part);
+  }
+  return { parts: kept, dropped };
+}
+
+/** 复核判输的一条落成可核对的被剔段（正文 + 原区间，有就带上）。 */
+function discardOf(entry: { text?: unknown; item?: unknown } | null | undefined): SplitPart {
+  const item = (entry?.item || {}) as SplitPart;
+  const text = String(entry?.text ?? item?.text ?? '');
+  return {
+    ...item,
+    text,
+    evidence: String(item?.evidence ?? text.slice(0, 24)),
+    keptFacts: [],
+  };
+}
+
+/** lint 复核的产物：留下来的段 + 两路被剔段（都带回给覆盖校验）。 */
+interface LintReviewResult {
+  ok: boolean;
+  parts: SplitPart[];
+  charsAfter: number;
+  lintDiscards: SplitPart[];
+  dedupeDiscards: SplitPart[];
 }
 
 /**
@@ -638,15 +824,16 @@ function dedupeParts(parts: unknown): SplitPart[] {
  *   ③ 判 redo 的换切点重做**一次**（不占结构轮次，也不循环）；切分点协议下「重做」= 换切点，
  *      正文仍由原文切，不许改写。重做后再过一遍代码 lint，仍不过落 discards(LINT_REJECT)。
  *
- * @returns {Promise<{ok:boolean, parts:Array, charsAfter:number}>} ok=false = 剔完不足两段，整条退拆
+ * @returns {Promise<{ok:boolean, parts:Array, charsAfter:number, lintDiscards:Array, dedupeDiscards:Array}>}
+ *          ok=false = 剔完不足两段，整条退拆；两路被剔段无论 ok 与否都带回。
  */
 async function applyLintReview({
   firstParts, source, sourceId, type, ts, round, llm, provider, model, maxTokens,
   db, maxChars, log, lintCfg, textLint, state,
-}: ApplyLintReviewArgs): Promise<{ ok: boolean; parts: SplitPart[]; charsAfter: number }> {
+}: ApplyLintReviewArgs): Promise<LintReviewResult> {
   const firstLint = textLint ? lintItems<SplitPart>(firstParts) : { accepted: [], rejected: [] };
   if (!textLint || !firstLint.rejected.length) {
-    return { ok: true, parts: firstParts, charsAfter: sumChars(firstParts) };
+    return { ok: true, parts: firstParts, charsAfter: sumChars(firstParts), lintDiscards: [], dedupeDiscards: [] };
   }
   const codes = [...new Set(firstLint.rejected.flatMap((entry) => entry.violations.map((v) => v.code)))];
   log?.(`[split] item=${sourceId} 第 ${round} 轮 ${firstLint.rejected.length} 段命中代码标记（${codes.join(',')}），交复核`);
@@ -663,7 +850,10 @@ async function applyLintReview({
     ...firstLint.accepted.map((entry) => entry.item),
     ...judged.keep.map((entry) => ({ ...entry.item, ...lintKeptMarker(entry) })),
   ] as SplitPart[];
-  let finalParts = dedupeParts(keepParts);
+  const dedupedKeep = dedupeParts(keepParts);
+  let finalParts = dedupedKeep.parts;
+  let lintDiscards: SplitPart[] = [];
+  let dedupeDiscards: SplitPart[] = [...dedupedKeep.dropped];
   const rejectAll = (entries: ReviewItem[]) => {
     const list = mergeReviewRejects(entries, judged.redo);
     recordLintRejects(db, list.map((r) => ({ ...r, sourceId })), { action: 'split', sourceId, log } as unknown as { action?: string; sourceId?: string; log?: (line: string) => void });
@@ -673,20 +863,31 @@ async function applyLintReview({
   if (!judged.redo.length) {
     log?.(`[split] item=${sourceId} 复核放行 ${judged.keep.length} 段（误杀），不用重切`);
   } else if (state.retried === 0) {
-    finalParts = await redoAfterLint({
+    const redone = await redoAfterLint({
       judged, source, sourceId, type, ts, llm, provider, model, maxTokens, db, maxChars, log, keepParts, rejectAll, state,
     });
+    finalParts = redone.parts;
+    lintDiscards = redone.lintDiscards;
+    dedupeDiscards = redone.dedupeDiscards;
   } else {
     // 已经重做过一次：不再循环，直接落账
     rejectAll(judged.redo);
+    lintDiscards = judged.redo.map(discardOf);
   }
-  return { ok: finalParts.length >= 2, parts: finalParts, charsAfter: sumChars(finalParts) };
+  return {
+    ok: finalParts.length >= 2,
+    parts: finalParts,
+    charsAfter: sumChars(finalParts),
+    lintDiscards,
+    dedupeDiscards,
+  };
 }
 
 /** lint 判 redo 后的那一次重切：只换切分点，正文仍逐字来自原文；仍不合格就按复核结果落账。 */
 async function redoAfterLint({
   judged, source, sourceId, type, ts, llm, provider, model, maxTokens, db, maxChars, log, keepParts, rejectAll, state,
-}: RedoAfterLintArgs): Promise<SplitPart[]> {
+}: RedoAfterLintArgs): Promise<{ parts: SplitPart[]; lintDiscards: SplitPart[]; dedupeDiscards: SplitPart[] }> {
+  const firstRoundDiscards = judged.redo.map(discardOf);
   let retryAnswer = null;
   try {
     retryAnswer = await askParts({
@@ -699,14 +900,16 @@ async function redoAfterLint({
   }
   if (!retryAnswer) {
     rejectAll(judged.redo);
-    return dedupeParts(keepParts);
+    const kept = dedupeParts(keepParts);
+    return { parts: kept.parts, lintDiscards: firstRoundDiscards, dedupeDiscards: kept.dropped };
   }
   const retryChecked = validateParts(retryAnswer, source, { maxChars });
   if (!retryChecked.ok) {
     // 重做那版切分不合格：第一轮被打回的按复核结果落账，不入库
     log?.(`[split] item=${sourceId} lint 重做版切分不合格（${retryChecked.reason}），按第一轮结果处理`);
     rejectAll(judged.redo);
-    return dedupeParts(keepParts);
+    const kept = dedupeParts(keepParts);
+    return { parts: kept.parts, lintDiscards: firstRoundDiscards, dedupeDiscards: kept.dropped };
   }
   const retryLint = lintItems(retryChecked.parts);
   const passed = retryLint.accepted.map((entry) => entry.item);
@@ -722,7 +925,13 @@ async function redoAfterLint({
   );
   // 切分点协议下重做给的是**整条**切分方案（cuts 覆盖全文），所以整体替换，
   // 不再和第一轮的 keep 段拼——拼起来会出两段重叠正文。
-  return dedupeParts(passed.length ? passed : keepParts);
+  const kept = dedupeParts(passed.length ? passed : keepParts);
+  return {
+    parts: kept.parts,
+    // 第一轮被判 redo 的正文也要纳入覆盖判定：重做方案没接住就是丢内容
+    lintDiscards: [...firstRoundDiscards, ...retryLint.rejected.map(discardOf)],
+    dedupeDiscards: kept.dropped,
+  };
 }
 
 /**
@@ -756,6 +965,8 @@ export async function split(opts: SplitOptions = {}): Promise<SplitResult | unde
     // lint 两级复核；false = 完全走旧逻辑
     lintReview = true,
     lintReviewTimeoutMs = 0,
+    // 段级信号是否硬拒（pipeline.splitSignalsStrict）；默认 false = 只记
+    signalsStrict = false,
   } = opts;
   const source = String(text ?? '').trim();
   if (!source) throw new Error('split: text 为空');
@@ -789,8 +1000,22 @@ export async function split(opts: SplitOptions = {}): Promise<SplitResult | unde
     }
 
     if (answer) {
-      const checked = validateParts(answer, source, { maxChars });
+      const checked = validateParts(answer, source, { maxChars, signalsStrict });
       if (checked.ok) {
+        // 段级自足性信号（2026-11-20 P0 阶段一）：一字不拒，只落一行日志与返回字段。
+        // 每条 signal 一行（code + 段首 30 字），末尾汇总一行便于 grep 统计。
+        const signals = Array.isArray(checked.signals) ? checked.signals : [];
+        for (const signal of signals) {
+          log?.(`[split] item=${sourceId} signal=${signal.code} at=${signal.index} ${signal.hint}`);
+        }
+        if (signals.length) {
+          const counts = signals.reduce<Record<string, number>>((acc, signal) => {
+            acc[signal.code] = (acc[signal.code] || 0) + 1;
+            return acc;
+          }, {});
+          const codeText = Object.entries(counts).map(([code, n]) => `${code}:${n}`).join(',');
+          log?.(`[split] item=${sourceId} signals=${signals.length} codes=${codeText}（只记不拒）`);
+        }
         // 正文 lint（2026-11-06；2026-11-06 改两级）：
         // ① 代码 lint 只打标记，命中的段落进可疑集；
         // ② 复核 agent 裁决，整批**只发一次**调用：keep = 误杀原样放行，redo = 真有问题；
@@ -820,8 +1045,13 @@ export async function split(opts: SplitOptions = {}): Promise<SplitResult | unde
           charsBefore: checked.charsBefore!,
           charsAfter: linted.charsAfter,
           longKept: checked.longKept,
-          cuts: checked.offsets,
+          // 最终布局：二次切分与 lint 重做之后每段的起点，与 parts 一一对应
+          cuts: linted.parts.slice(1).map((part) => Number(part.start)),
           lintRejected: lintState.lintRejected,
+          lintDiscards: linted.lintDiscards,
+          dedupeDiscards: linted.dedupeDiscards,
+          // 段级信号：阶段一只供统计，不参与成败
+          signals,
         };
       }
       if (checked.unavoidable) {

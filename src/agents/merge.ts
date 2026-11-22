@@ -226,11 +226,14 @@ export interface ValidateOpsResult {
 export const MERGE_SYSTEM = `你是长期记忆的合并整理员。输入一批已有记忆条目和它们的近似候选。你只做三件事：把同一事实的重复表述合并、把过时事实改成新版本、把已失效的条目归档。
 
 硬规矩
-1. 不许新增原条目里没有的事实。任何数字、日期、路径、配置值都必须能在某条原文里逐字找到，并在 evidence 里标来源 id 和原句。
+1. 不许新增原条目里没有的事实。任何数字、日期、路径、配置值都必须能在某条原文里逐字找到，并在 evidence 里标来源 id 和原句。证据里的路径、行号和单位先按原文写法保留。
 2. 正文超过 200 字不许截断、不许丢：整段放进 text，置 needsSplit=true，交给拆分员处理。
 3. 合并只在「同一件事的不同表述」之间做。不同事件即使主题相近也不许并。合并后若会丢失条件、期限、边界值，就不许合并，改 op=update 或者不动。
 4. 拿不准就输出空 ops，宁可不动。
 5. 只输出 JSON，不要解释。
+
+版本规则
+合并前先核对对象、事件、版本和适用范围。改稿后的复核不得借用上一版的理由。某项 pass 只代表该版本的该项通过，有最终 ask 或 abort 时一并保留。只有原文明示新版本取代旧版本时才 update。分不清版本就跳过这一组。测试数、产物数和验收标准要带项目与批次，避免把一次迁移的基线写成通用要求。
 
 ${SELF_CONTAINED_RULES}
 
@@ -827,6 +830,19 @@ const DATE_RE = /\d{4}[-/年.]\d{1,2}[-/月.]\d{1,2}日?/g;
 const PATH_RE = /(?:~|\/)[\w.@%+-]+(?:\/[\w.@%+-]+)+/g;
 const KV_RE = /\b[A-Za-z_][\w.-]{0,40}\s*(?:=|:|：)\s*(?:true|false|null|-?\d+(?:\.\d+)?|"[^"\n]{0,80}"|'[^'\n]{0,80}'|[A-Za-z0-9_./:%+-]{1,80})/g;
 const NUMBER_RE = /\d+(?:\.\d+)?/g;
+/** 「文件名:行号」。两个部件必须分开比对：拼成一个 token（如 `sleepjs382`）永远对不上
+ *  证据里「lib/sleep.js 文件第 382 行」这种写法（2026-11-22 误杀）。 */
+const FILE_LINE_RE = /[\w.@%+-]+\.[A-Za-z]{1,8}\s*[:：]\s*\d+/g;
+
+/** 一条必须被证据覆盖的事实。 */
+export interface ExtractedFact {
+  kind: string;
+  raw: string;
+  forms: string[];
+  /** kind='file_line' 时：文件名与行号分开存，校验时要求落在同一句里。 */
+  file?: string;
+  line?: string;
+}
 
 function dateForms(raw: unknown): string[] {
   const m = String(raw).match(/^(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})/);
@@ -841,9 +857,9 @@ function dateForms(raw: unknown): string[] {
  * 从正文里抠出必须被证据覆盖的事实：日期、路径、配置键值、剩余数字。
  * 日期/路径/键值先占位，落在它们里面的数字不再单独要求（否则「07」和「7」永远对不上）。
  */
-export function extractFacts(text: unknown): Array<{ kind: string; raw: string; forms: string[] }> {
+export function extractFacts(text: unknown): ExtractedFact[] {
   const body = String(text ?? '');
-  const facts: Array<{ kind: string; raw: string; forms: string[] }> = [];
+  const facts: ExtractedFact[] = [];
   const covered: Array<[number, number]> = [];
   const overlaps = (start: number, end: number) => covered.some(([s, e]) => start < e && end > s);
   const scan = (re: RegExp, kind: string, formsOf: (raw: string) => string[]) => {
@@ -859,21 +875,48 @@ export function extractFacts(text: unknown): Array<{ kind: string; raw: string; 
   };
 
   scan(DATE_RE, 'date', dateForms);
+  // 先于 KV/PATH：否则 `sleep.js:382` 会被 KV_RE 整段吃成一条键值事实
+  scan(FILE_LINE_RE, 'file_line', () => []);
   scan(PATH_RE, 'path', (raw) => [normalizeQuote(raw)]);
   scan(KV_RE, 'kv', (raw) => [normalizeQuote(raw)]);
   scan(NUMBER_RE, 'number', (raw) => [...new Set([normalizeQuote(raw), normalizeQuote(String(Number(raw)))])]);
 
+  for (const fact of facts) {
+    if (fact.kind !== 'file_line') continue;
+    const cut = fact.raw.search(/[:：]/);
+    if (cut <= 0) continue;
+    fact.file = fact.raw.slice(0, cut).trim();
+    fact.line = fact.raw.slice(cut + 1).trim();
+  }
+
   // 去重：同一事实只说一次
   const seen = new Set<string>();
   return facts.filter((f) => {
-    const key = `${f.kind}\u0000${f.forms.join('\u0001')}`;
+    const key = `${f.kind}\u0000${f.forms.join('\u0001')}\u0000${f.file ?? ''}\u0000${f.line ?? ''}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 }
 
-function factInQuotes(fact: { forms: string[] }, quotes: string[]): boolean {
+/** 按句末标点和换行切句，切完再归一化：文件名与行号必须在同一句里对得上。 */
+function sentencesOf(text: unknown): string[] {
+  return String(text ?? '')
+    .split(/[。！？!?；;\n]+/)
+    .map((sentence) => normalizeQuote(sentence))
+    .filter(Boolean);
+}
+
+/** file_line 事实：同一句里同时出现文件名和行号才算命中，不拼成单个 token 比。 */
+function fileLineHit(fact: ExtractedFact, text: unknown): boolean {
+  const file = normalizeQuote(fact.file);
+  const line = normalizeQuote(fact.line);
+  if (!file || !line) return false;
+  return sentencesOf(text).some((sentence) => sentence.includes(file) && sentence.includes(line));
+}
+
+function factInQuotes(fact: ExtractedFact, quotes: string[]): boolean {
+  if (fact.kind === 'file_line') return quotes.some((quote) => fileLineHit(fact, quote));
   for (const quote of quotes) {
     const normalized = normalizeQuote(quote);
     if (fact.forms.some((form) => form && normalized.includes(form))) return true;
@@ -882,7 +925,8 @@ function factInQuotes(fact: { forms: string[] }, quotes: string[]): boolean {
 }
 
 /** 第二层：在源条目正文里找（quote 是摘录，模型常把前缀截掉，事实可能落在被截的那段）。 */
-function factInSources(fact: { forms: string[] }, texts: string[]): boolean {
+function factInSources(fact: ExtractedFact, texts: string[]): boolean {
+  if (fact.kind === 'file_line') return texts.some((text) => fileLineHit(fact, text));
   for (const text of texts) {
     const normalized = normalizeQuote(text);
     if (fact.forms.some((form) => form && normalized.includes(form))) return true;

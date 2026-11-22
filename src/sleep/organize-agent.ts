@@ -375,6 +375,8 @@ async function organizePassAgent({ dryRun = false } = {}) {
         textLint: cfg.pipeline?.textLint !== false,
         lintReview: cfg.pipeline?.lintReview !== false,
         lintReviewTimeoutMs: cfg.pipeline?.lintReviewTimeoutMs,
+        // 段级信号是否硬拒：默认 false（只记），阶段二才开
+        signalsStrict: cfg.pipeline?.splitSignalsStrict === true,
         db: pendingDb(),
         store,
         llm: llmOf(ctx, { site: 'split', log: (line: string) => log(cfg, line), cfg }),

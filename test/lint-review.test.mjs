@@ -415,3 +415,8 @@ test('复核调用传细流：慢但活着不降级，真卡住才走 fallback',
   assert.equal(bad.fallback, true);
   assert.ok(logs.some((l) => l.includes('[lint-review] fallback') && l.includes('空闲超时')));
 });
+
+test('提示词：文件名/行号只提供定位，缺完整陈述即使带路径也判 redo', () => {
+  assert.match(LINT_REVIEW_SYSTEM, /文件名、行号、数字只提供定位/);
+  assert.match(LINT_REVIEW_SYSTEM, /缺完整陈述（例如只有「lib\/gate\.js 的」）的片段即使带路径也判 redo/);
+});

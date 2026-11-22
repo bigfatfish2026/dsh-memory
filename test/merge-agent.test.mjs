@@ -491,3 +491,49 @@ test('宿主抛错且输出真坏：不吞错，仍 call_fail，trace 保留已�
   assert.match(failures[0].summary, /host:MALFORMED_RESPONSE/, '宿主错误进 last_error');
   assert.match(failures[0].summary, /tool=8字:"/, '已收到的 partials 原文留在摘要里');
 });
+
+test('提示词：版本规则段与证据写法保留句都在 MERGE_SYSTEM 里', () => {
+  assert.equal(MERGE_SYSTEM.includes('版本规则'), true);
+  assert.equal(MERGE_SYSTEM.includes('合并前先核对对象、事件、版本和适用范围'), true);
+  assert.equal(MERGE_SYSTEM.includes('改稿后的复核不得借用上一版的理由'), true);
+  assert.equal(MERGE_SYSTEM.includes('只有原文明示新版本取代旧版本时才 update'), true);
+  assert.equal(MERGE_SYSTEM.includes('分不清版本就跳过这一组'), true);
+  assert.equal(MERGE_SYSTEM.includes('避免把一次迁移的基线写成通用要求'), true);
+  assert.equal(MERGE_SYSTEM.includes('证据里的路径、行号和单位先按原文写法保留'), true);
+});
+
+test('事实校验：文件名与行号同句出现 → 放行（不再拼成单个 token 比）', () => {
+  const items = [{
+    id: 'm_fl',
+    type: 'world',
+    text: '入口在 lib/sleep.js 第 382 行，sleep 周期 1800 秒。',
+  }];
+  const ops = [{
+    op: 'update',
+    ids: ['m_fl'],
+    text: '入口在 lib/sleep.js:382。',
+    evidence: [{ id: 'm_fl', quote: '入口在 lib/sleep.js 第 382 行' }],
+  }];
+  const { valid, invalid } = validateOps(ops, items);
+  assert.equal(invalid.length, 0, `同句命中不该判废：${invalid.map((x) => x.reason).join(',')}`);
+  assert.equal(valid.length, 1);
+});
+
+test('事实校验：文件名与行号分属两句 → 仍拒 fact_not_in_evidence', () => {
+  const items = [{
+    id: 'm_fl2',
+    type: 'world',
+    text: '入口在 lib/sleep.js。另记行号 382 在附录里。',
+  }];
+  const ops = [{
+    op: 'update',
+    ids: ['m_fl2'],
+    text: '入口在 lib/sleep.js:382。',
+    evidence: [{ id: 'm_fl2', quote: '入口在 lib/sleep.js' }],
+  }];
+  const { valid, invalid } = validateOps(ops, items);
+  assert.equal(valid.length, 0, '跨句同现不算证据');
+  assert.equal(invalid.length, 1);
+  assert.equal(invalid[0].reason, 'fact_not_in_evidence');
+  assert.equal(invalid[0].fact, 'sleep.js:382');
+});

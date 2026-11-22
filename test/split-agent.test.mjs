@@ -376,14 +376,16 @@ test('接线：五条子段逐条过闸，命中 DUPLICATE 的那段记 discards
   assert.equal(discards[0].matched_id, 'm_dup');
   assert.equal(discards[0].candidate_hash, hashText(dupText));
 
-  const src = readAll(dbPath, 'SELECT status, reason FROM memories WHERE id = ?', 'm_src')[0];
+  const src = readAll(dbPath, 'SELECT status, reason, supersededBy FROM memories WHERE id = ?', 'm_src')[0];
   assert.equal(src.status, 'archived');
   assert.match(src.reason, /拆成 4 条/);
+  assert.ok(String(src.supersededBy || ''), '归档时同一笔事务写 supersededBy');
 
   const inserted = readAll(dbPath, "SELECT id, text, supersedes FROM memories WHERE source = 'sleep:split:m_src'");
   assert.equal(inserted.length, 4);
+  assert.ok(inserted.some((row) => row.id === src.supersededBy), 'supersededBy 指向落库子段');
   for (const row of inserted) {
-    assert.deepEqual(JSON.parse(row.supersedes), ['m_src']);
+    assert.equal(row.supersedes, null, '子段保存不再写 supersedes，取代关系只在归档事务里写');
     assert.equal(SOURCE.includes(row.text), true, '入库的每一段都是原文片段');
   }
   const ops = readAll(dbPath, "SELECT status FROM pending_ops WHERE kind = 'split_item'");
@@ -419,4 +421,25 @@ test('接线：合并 add 候选没有原条，切完直接入库、不归档、
   assert.equal(hasOrphanOriginal, 0);
   const ops = readAll(dbPath, "SELECT status FROM pending_ops WHERE kind = ?", 'split_item');
   assert.equal(ops[0].status, 'done');
+});
+
+test('提示词：不可拆 JSON 模板、空 cuts 约束、正反例块不超过 6 行', () => {
+  assert.equal(
+    SPLIT_SYSTEM.includes('{"cuts":[],"unavoidable":true,"reason":"一句话说明原因"}'),
+    true,
+    '拆不开时要有固定 JSON 模板',
+  );
+  assert.equal(SPLIT_SYSTEM.includes('空 cuts 不能配 unavoidable:false'), true, '空 cuts 必须配 unavoidable:true');
+  assert.equal(SPLIT_SYSTEM.includes('否定、条件和结论要留在同一段'), true);
+  assert.equal(SPLIT_SYSTEM.includes('正常拆分时 cuts 至少一项'), true, '不再无条件要求 cuts 至少一项');
+
+  const prompt = buildSplitPrompt({ sourceId: 'm_src', text: '原文' });
+  const lines = prompt.split('\n');
+  const start = lines.findIndex((line) => line.startsWith('可拆：'));
+  assert.notEqual(start, -1, '输出模板要有可拆正例');
+  const block = lines.slice(start);
+  assert.equal(block.length <= 6, true, `正反例块不超过 6 行，实际 ${block.length}`);
+  assert.equal(block[0].includes('"unavoidable":false'), true);
+  assert.equal(block[1].startsWith('不可拆：'), true);
+  assert.equal(block[1].includes('{"cuts":[],"unavoidable":true'), true);
 });
