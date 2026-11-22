@@ -10,6 +10,9 @@ import { hasOriginColumn, deleteMemoryEntity } from '../entity-gate.js';
 import { allocRowSeq, existingRowSeq, upsertRow } from './rows.js';
 import { assertTextLint, assertWriteAllowed, discardedRecord, supersededRow } from './gate.js';
 import { writeCoarseEntities } from './entities.js';
+import { entityKeysMountedOn, entityKeysOf, notifyEntityNamesChanged } from './observe-notify.js';
+import { reviewObservationsOnEvidenceChange } from './observation-review.js';
+import type { ReviewResult } from './observation-review.js';
 import { clamp01, dateFromHead, dateOnly, entityList, normalizeType } from './types.js';
 import { logStore } from './log.js';
 import type {
@@ -35,8 +38,8 @@ interface WriteNewRecordInput {
   vec: ArrayLike<number>;
 }
 
-/** 组装新记录的入参（save / merge 同一口径）。 */
-interface NewRecordInput {
+/** 组装新记录的入参（save / merge / observation 同一口径）。 */
+export interface NewRecordInput {
   trimmed: string;
   tagList: string[];
   type: string;
@@ -75,7 +78,7 @@ interface MergeFields {
  * 唯一的写入收尾。事务体的差异由 work(d) 提供；事务边界、版本号、内存索引、
  * 事件只在这里动，save / update / merge 共用。
  */
-function commitWrite(state: StoreState, { action, work, nextMetas, rowSeqId, enqueueId = null }: CommitWriteInput): number {
+export function commitWrite(state: StoreState, { action, work, nextMetas, rowSeqId, enqueueId = null }: CommitWriteInput): number {
   const seq = state.writeTx(action, work);
   state.metas = nextMetas;
   if (rowSeqId) {
@@ -84,6 +87,20 @@ function commitWrite(state: StoreState, { action, work, nextMetas, rowSeqId, enq
   }
   if (enqueueId) state.enqueueEntityLater(enqueueId);
   return seq;
+}
+
+/**
+ * 证据复核改了别的观察行，要把新状态并回 nextMetas。
+ * commitWrite 的 nextMetas 在事务体之前求值，事务里改的行不并进去，下一次写会拿旧状态。
+ */
+function mergeReviewUpdates(nextMetas: MemoryRecord[], results: ReviewResult[]): void {
+  for (const result of results) {
+    for (const record of result.updated) {
+      const at = nextMetas.findIndex((m) => m.id === record.id);
+      if (at >= 0) nextMetas[at] = record;
+      else nextMetas.push(record);
+    }
+  }
 }
 
 /**
@@ -108,7 +125,7 @@ export function writeNewRecordTx(state: StoreState, d: DatabaseSync, { record, s
  * 两边口径必须一致：id/ts 生成、opinion 置信度、entities 老列、validFrom/validTo、supersedes。
  * 2026-11-15 抽出来——merge 改成一笔事务后不能再借 saveMemory，不抽就会两处漂移。
  */
-function buildNewRecord({ trimmed, tagList, type, source, meta, entities = [], validFrom = '', supersedes = [] }: NewRecordInput): MemoryRecord {
+export function buildNewRecord({ trimmed, tagList, type, source, meta, entities = [], validFrom = '', supersedes = [] }: NewRecordInput): MemoryRecord {
   const record: MemoryRecord = {
     id: `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
     text: trimmed,
@@ -119,6 +136,10 @@ function buildNewRecord({ trimmed, tagList, type, source, meta, entities = [], v
   };
   if (type === 'opinion') record.confidence = clamp01(meta.confidence, 0.7);
   else if (meta.confidence !== undefined) record.confidence = clamp01(meta.confidence, 1);
+  // 拆分子段要「写入那一刻就不可召回」：status 在同一笔 save 事务里落库，别事后再补一次 UPDATE。
+  if (meta.status) record.status = String(meta.status);
+  // 组标记进 extra（recordToRow 把非标准列全塞 extra），整组收尾时按 source/expected/index 对账。
+  if (meta.__splitGroup) record.splitGroup = meta.__splitGroup;
   // memories.entities 老列留着做双读对照：工具路径写粗实体名，内部路径仍写自己给的
   if (entities.length) record.entities = [...new Set(entities)];
   // validFrom 服务端写：调用方给的（内部路径）优先，工具路径靠正文头部日期反抽
@@ -178,6 +199,10 @@ export async function saveMemory(
   // 2026-11-05 t-fix-first-run：带 supersedes 时把被取代的 id 也排除出召回，
   // 否则「新条取代旧条」会被旧条自己判成 DUPLICATE，整个 SUPERSEDES 路径走不通。
   const supersedes = entityList(meta.supersedes).filter((id) => state.metas.some((m) => m.id === id));
+  // 只排除出闸、不建立取代关系：拆分子段保存时原条不能把子段判成 DUPLICATE，
+  // 但 supersededBy/validTo 要等归档那笔事务再写（本票的 supersedes 副作用修复）。
+  const gateExclude = [...new Set([...supersedes, ...entityList(meta.__gateExclude)])]
+    .filter((id) => state.metas.some((m) => m.id === id));
   // 2026-11-13：实体必须在过闸之前算（写入闸 related 通道吃 entities），
   // 内部路径（sleep/consolidate/split）自带 entities 就照用，工具路径没有就靠粗实体兜。
   const explicitEntities = entityList(meta.entities);
@@ -187,7 +212,7 @@ export async function saveMemory(
     ? null
     : await assertWriteAllowed(state, 'save', {
       text: trimmed, type, tags: tagList, entities: gateEntities, source, sourceFile: meta.sourceFile,
-    }, { vector: vec, excludeIds: supersedes, ids: [], lintReview: meta.__lintReview });
+    }, { vector: vec, excludeIds: gateExclude, ids: [], lintReview: meta.__lintReview });
   if (gateResult?.verdict === 'DUPLICATE') return discardedRecord(trimmed, tagList, type, gateResult);
 
   // supersedes 上面已经算好（过闸前就要用它排除召回），这里只补写入闸判定的那条
@@ -206,7 +231,13 @@ export async function saveMemory(
   // 向量与正文同事务：vecDb 用的是同一个 sqlite 连接；rowSeq 也在事务里取（见 allocRowSeq）
   commitWrite(state, {
     action: 'save',
-    work: (d) => writeNewRecordTx(state, d, { record, supersededUpdates, coarseHits, vec }),
+    work: (d) => {
+      const rowSeq = writeNewRecordTx(state, d, { record, supersededUpdates, coarseHits, vec });
+      // 新条实体与记忆同笔事务登记（docs/observation-plan-v2.md §4）：交给 observation 侧重算。
+      // 拆分子段传 __observeReason='split'；其余新建路径默认 'new-memory'。
+      notifyEntityNamesChanged(d, state.cfg, record.entities || [], String(meta.__observeReason || 'new-memory'));
+      return rowSeq;
+    },
     nextMetas,
     rowSeqId: record.id,
     // 事务外异步入队，交给 entity_extract 补实体（同一进程里排一次就够，dedupe_key=memory_id）
@@ -331,6 +362,10 @@ export async function updateMemory(state: StoreState, id: string, patch: MemoryP
   commitWrite(state, {
     action: 'update',
     work: (d) => {
+      // 旧挂载必须在 deleteMemoryEntity 之前取：改写/归档的受影响实体是「旧 ∪ 新」，
+      // 光看 memories.entities 老列会漏掉 agent 后补的挂载（docs/observation-plan-v2.md §4）。
+      const observeChanged = patch.text !== undefined || patch.entities !== undefined || patch.status === 'archived';
+      const priorKeys = observeChanged ? entityKeysMountedOn(d, id) : [];
       const rowSeq = existingRowSeq(state, d, id) ?? allocRowSeq(d);
       upsertRow(state, next, rowSeq);
       if (nextVec) state.vecDb!.replace(id, nextVec);
@@ -339,8 +374,30 @@ export async function updateMemory(state: StoreState, id: string, patch: MemoryP
       // 只删 origin='rule' 的话 agent 从旧正文抽出来的挂载会留在新正文上（2026-11-15，审计实体中-8）。
       // 老库没有 origin 列时整段跳过——宁可留旧行，也不能误删
       if (coarseHits && hasOriginColumn(d)) {
-        deleteMemoryEntity(d, { memoryId: id });
+        deleteMemoryEntity(d, { memoryId: id, skipReview: true });
         writeCoarseEntities(state, d, id, coarseHits, next.ts || '');
+      }
+      // 归档 reason='archive'；正文/实体改写 reason='rewrite'；拆分由 archive 的
+      // opts.observeReason 覆盖成 'split'，并把子段实体一起带进来（同一笔事务）。
+      if (observeChanged) {
+        const reason = String(patch.__observeReason || (patch.status === 'archived' ? 'archive' : 'rewrite'));
+        notifyEntityNamesChanged(d, state.cfg, [
+          ...priorKeys,
+          ...entityKeysOf(prev.entities || []),
+          ...entityKeysOf(next.entities || []),
+          ...entityKeysOf((patch.__observeEntities as unknown[]) || []),
+        ], reason);
+      }
+      // 证据失效 / 正文改写：引用它的自动观察就地复核。
+      // 放在登记之后：复核转 pending_review 时的 reason='review' 要盖过上面的 archive/rewrite。
+      const becameArchived = patch.status === 'archived'
+        && String(prev.status || 'active').toLowerCase() !== 'archived';
+      const textChanged = patch.text !== undefined && String(next.text) !== String(prev.text || '');
+      if (becameArchived || textChanged) {
+        mergeReviewUpdates(nextMetas, [reviewObservationsOnEvidenceChange(d, {
+          kind: becameArchived ? 'archive' : 'rewrite',
+          evidenceIds: [id],
+        }, { cfg: state.cfg })]);
       }
       return rowSeq;
     },
@@ -350,8 +407,31 @@ export async function updateMemory(state: StoreState, id: string, patch: MemoryP
   return next;
 }
 
-export async function archiveMemory(state: StoreState, id: string, reason?: string): Promise<SavedRecord | DiscardedRecord> {
-  return updateMemory(state, id, { status: 'archived', reason: reason || '' });
+/** archive 的附加字段：取代关系/有效期只在真正归档的这一笔事务里写，不跟子段保存同事务。 */
+export interface ArchiveOptions {
+  /** 指向承接原条的落库条目（拆分时是最后一个子段 id）。 */
+  supersededBy?: string;
+  /** 子段的结构字段，用来推 validTo；老口径是 prior.validTo || child.validFrom || child.ts。 */
+  childValidFrom?: string;
+  childTs?: string;
+  /** 拆分场景：子段实体也在这笔归档事务里一起登记待观察（去重由 observe-notify 做）。 */
+  observeEntities?: string[];
+  /** 覆盖登记原因；默认按 status 走 'archive'，拆分传 'split'。 */
+  observeReason?: string;
+}
+
+export async function archiveMemory(state: StoreState, id: string, reason?: string, opts: ArchiveOptions = {}): Promise<SavedRecord | DiscardedRecord> {
+  const patch: MemoryPatch = { status: 'archived', reason: reason || '' };
+  if (opts.observeReason) patch.__observeReason = opts.observeReason;
+  if (opts.observeEntities?.length) patch.__observeEntities = opts.observeEntities;
+  if (opts.supersededBy) {
+    const prev = state.metas.find((m) => m.id === id);
+    patch.supersededBy = opts.supersededBy;
+    const to = prev?.validTo || dateOnly(opts.childValidFrom) || dateOnly(opts.childTs) || dateOnly(new Date().toISOString());
+    if (to) patch.validTo = to;
+  }
+  // 归档状态与 supersededBy/validTo 一起走 updateMemory 的同一笔 writeTx
+  return updateMemory(state, id, patch);
 }
 
 /** 合并时把结构字段带过去：取最早的 validFrom、最高置信度、实体并集。 */
@@ -446,17 +526,38 @@ export async function mergeMemories(
   commitWrite(state, {
     action: 'merge',
     work: (d) => {
+      // 源条挂载在这笔事务里会被删，实体键必须在删除前取；和源条 entities、新条实体并集登记
+      const sourceKeys: string[] = [];
+      for (const id of list) {
+        sourceKeys.push(...entityKeysMountedOn(d, id));
+        const prior = state.metas.find((m) => m.id === id);
+        sourceKeys.push(...entityKeysOf(prior?.entities || []));
+      }
       const rowSeq = writeNewRecordTx(state, d, { record, supersededUpdates, vec });
       for (const update of mergedUpdates) upsertRow(state, update, existingRowSeq(state, d, update.id) ?? allocRowSeq(d));
       // 源条退场，挂载跟着清：合并掉的记忆不该还挂在实体上占 mem_count / surface.count，
       // 也不该再被实体通道召回（审计实体中-7/中-8/中-9 的删除面）。
       for (const id of list) {
         try {
-          deleteMemoryEntity(d, { memoryId: id });
+          deleteMemoryEntity(d, { memoryId: id, skipReview: true });
         } catch (error) {
           logStore(state.cfg, 'WARN', '合并时清挂载失败（合并照做）', `${id}：${String((error && (error as { message?: unknown }).message) || error)}`);
         }
       }
+      notifyEntityNamesChanged(d, state.cfg, [
+        ...sourceKeys,
+        ...entityKeysOf(record.entities || []),
+        ...entityKeysOf([...entities]),
+      ], 'merge');
+      // 源条并进新条：引用源条的自动观察改指后继（不合法就删边），再按来源根重算。
+      // 新条与源条的 merged 状态都已在本笔事务里落库，后继校验读到的是最新状态。
+      const successorOf: Record<string, string> = {};
+      for (const id of list) successorOf[id] = record.id;
+      mergeReviewUpdates(nextMetas, [reviewObservationsOnEvidenceChange(d, {
+        kind: 'merge',
+        evidenceIds: list,
+        successorOf,
+      }, { cfg: state.cfg })]);
       return rowSeq;
     },
     nextMetas,

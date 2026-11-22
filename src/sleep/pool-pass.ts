@@ -2,7 +2,7 @@
  * 队列 + 池的调度器：起 ingest / curate / split / compact 四路池 → 等空 → 汇总。
  */
 import path from 'node:path';
-import { consumeSplitOps } from '../pipeline-split.js';
+import { consumeSplitOpsWithRecheck } from '../pipeline-split.js';
 import {
   claimChannelOps, reapChannelOps, channelStats, markOp, failFile, hasIngestTables, LEASE_MS,
 } from '../ingest-index.js';
@@ -15,6 +15,9 @@ import {
   formatIngestAdaptiveLog, formatStageAdaptiveLog, formatPoolSummary,
 } from '../concurrency.js';
 import { dayKey } from './slots.js';
+import { runObservationPass } from './observation-pass.js';
+import type { ObservationPassOutcome, ObservationPassStore } from './observation-pass.js';
+import type { AskObservationResult } from './model-calls.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { ChannelPoolOptions } from '../pool.js';
 import type { ConcurrencyPick } from '../concurrency.js';
@@ -83,6 +86,8 @@ interface PoolPassEnv {
   ingest: ReturnType<typeof createIngest>;
   pool: ReturnType<typeof createPool>;
   passes: ReturnType<typeof createPasses>;
+  /** observation 提炼的模型入口（worker 只用到 askObservation）。 */
+  model?: { askObservation: (system: string, user: string) => Promise<AskObservationResult> };
 }
 
 export function createPoolPass(env: PoolPassEnv) {
@@ -254,14 +259,21 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
       },
     } as unknown as ChannelPoolOptions);
 
-    // split 活是 curate 通道的另一种 kind：单独一个消费者，跟合并池并行，互不阻塞
+    // split 活是 curate 通道的另一种 kind：单独一个消费者，跟合并池并行，互不阻塞。
+    // 2026-11-20：合并/入库两路池在本轮收尾之前还在往队列里排 split_item，而拆分以前一领空就收工
+    // （11:08:02 那轮收尾后又排了 450 行入队事件，任务去重后 397 条 pending 一条没领）。
+    // 这个 promise 在 ingest/merge 两路池 drain 完之后 resolve，split 等到它再补扫一轮。
+    let producersFinished!: () => void;
+    const producersDone = new Promise<void>((resolve) => { producersFinished = resolve; });
     const splitTask = (async () => {
       if (dryRun) return null;
       try {
-        const sv = await consumeSplitOps({
+        const sv = await consumeSplitOpsWithRecheck({
           textLint: cfg.pipeline?.textLint !== false,
           lintReview: cfg.pipeline?.lintReview !== false,
           lintReviewTimeoutMs: cfg.pipeline?.lintReviewTimeoutMs,
+          // 段级信号是否硬拒：默认 false（只记），阶段二才开
+          signalsStrict: cfg.pipeline?.splitSignalsStrict === true,
           db: pendingDb() as DatabaseSync,
           store,
           llm: llmOf(ctx, { site: 'split', log: (line) => log(cfg, line), cfg }),
@@ -271,8 +283,13 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
           writeLock,
           maxChars: Number(cfg.splitMaxChars) || 200,
           log: poolLog,
-        } as unknown as Parameters<typeof consumeSplitOps>[0]);
-        curateStats.split = { scanned: sv.scanned, inserted: sv.inserted, deduped: sv.deduped, archived: sv.archived, failed: sv.failed, concurrency: sv.concurrency };
+          // 领空后等生产者收工再补扫；没活就停，最多 3 轮
+          awaitProducers: () => producersDone,
+        } as unknown as Parameters<typeof consumeSplitOpsWithRecheck>[0]);
+        curateStats.split = {
+          scanned: sv.scanned, inserted: sv.inserted, deduped: sv.deduped, archived: sv.archived,
+          failed: sv.failed, succeeded: sv.succeeded, pendingAfter: sv.pendingAfter, concurrency: sv.concurrency,
+        };
         return sv;
       } catch (error) {
         log(cfg, `[split] WARN pool 拆分段整段失败：${shortErr(error)}`);
@@ -284,10 +301,32 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
 
     ingestPool.start();
     mergePool.start();
+    const ingestDone = ingestPool.drain();
+    const mergeDone = mergePool.drain();
+    // 两路生产者收工（成功/失败都算）→ 放 split 补扫；drain 只调这一次，别重复 drain
+    const producersSettled = Promise.all([ingestDone, mergeDone]).then(() => producersFinished(), () => producersFinished());
     const [ingestPoolStats, mergePoolStats, splitSv] = await Promise.all([
-      ingestPool.drain(), mergePool.drain(), splitTask, compact.pool.drain(),
+      ingestDone, mergeDone, producersSettled.then(() => splitTask), compact.pool.drain(),
     ]);
     const compactStats = compact.stats;
+    // ④' observation 提炼：四路池（ingest / merge / split / compact）全部排空之后单独跑一段。
+    // 它自己有 observe_task 队列与 cfg.observe.enabled 开关；失败只在日志里留一行，
+    // 不影响本轮 sleep 的计数、备份与返回。
+    let observe: ObservationPassOutcome | null = null;
+    try {
+      observe = await runObservationPass(
+        {
+          store: env.store as unknown as ObservationPassStore,
+          cfg,
+          log: (line) => log(cfg, line),
+          model: env.model,
+          owner: sleepOwner,
+        },
+        { dryRun },
+      );
+    } catch (error) {
+      log(cfg, `[observe] WARN 整段失败（不影响本轮睡觉）：${shortErr(error)}`);
+    }
     // 写库串行闸的实测峰值：三个池共用一把闸，串行=1。日志里必须有这个数，
     // 不然「写库串行」只能靠读代码相信。
     const lockStats = typeof writeLock.stats === 'function' ? writeLock.stats() : null;
@@ -329,10 +368,15 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
     log(cfg, formatPoolSummary('ingest', ingestPoolStats as unknown as Record<string, unknown>));
     log(cfg, formatPoolSummary('curate', mergePoolStats as unknown as Record<string, unknown>));
     if (splitSv && splitSv.scanned) {
+      // 口径跟 pipeline-split 的汇总行一致（2026-11-22）：不可拆已经算在回队里，不再单列，
+      // 否则 493 会被算成 740，差值方向也跟着反。
       log(
         cfg,
         `[pool:curate-split] 并发 ${Math.min(splitSv.concurrency || 1, splitSv.scanned)} 路 条 ${splitSv.scanned} ` +
-          `成功 ${Math.max(0, splitSv.scanned - (splitSv.failed || 0))} 失败 ${splitSv.failed || 0}`,
+          `落库 ${splitSv.succeeded || 0} 全判重 ${splitSv.dedupedOnly || 0} 跳过 ${splitSv.skipped || 0} ` +
+          `回队 ${splitSv.pendingAfter || 0}（含不可拆 ${splitSv.unavoidable || 0}） 版本不符 ${splitSv.versionMismatch || 0} ` +
+          `覆盖未过 ${splitSv.coverageBlocked || 0} 判死 ${splitSv.inflateDead || 0} ` +
+          `失败 ${splitSv.failed || 0}`,
       );
     }
     const revokeArchived = compactStats.revoked || 0;
@@ -381,6 +425,8 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
       inserted: splitSv?.inserted || 0,
       deduped: splitSv?.deduped || 0,
       archived: splitSv?.archived || 0,
+      succeeded: splitSv?.succeeded || 0,
+      pendingAfter: splitSv?.pendingAfter || 0,
     };
     log(
       cfg,
@@ -408,6 +454,7 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
       splitArchived: splitInfo.archived,
       ingest: ingestStats,
       tidy: compactStats.tidy || null,
+      observe,
       pools: {
         ingest: ingestPoolStats,
         curate: mergePoolStats,

@@ -4,6 +4,9 @@
 import { llmOf } from '../llm-service.js';
 import { discardCountOf } from '../write-gate.js';
 import { dayKey } from './slots.js';
+import { runObservationPass } from './observation-pass.js';
+import type { ObservationPassOutcome, ObservationPassStore } from './observation-pass.js';
+import type { AskObservationResult } from './model-calls.js';
 import type { MemoryView } from '../store/types.js';
 import type { SleepStateStore } from '../sleep-state.js';
 import type { SleepCfg, SleepCtx, SleepStore } from './env.js';
@@ -103,6 +106,10 @@ interface PassesEnv {
   organize: { organizePass: (opts?: { dryRun?: boolean }) => Promise<OrganizeSummary> };
   poolPass: { pooledSleepPass: (opts?: { dryRun?: boolean; sinceHours?: number }) => Promise<unknown> };
   pool: { pipelineModeOf: () => string };
+  /** observation 提炼的模型入口（worker 只用到 askObservation）。 */
+  model?: { askObservation: (system: string, user: string) => Promise<AskObservationResult> };
+  /** 本实例的 sleep owner；observation 任务租约用。 */
+  sleepOwner?: string;
 }
 
 export function createPasses(env: PassesEnv) {
@@ -265,6 +272,26 @@ async function legacySleepPass({ dryRun = false, sinceHours = 0 }: { dryRun?: bo
     }
     result.revocation = revokeInfo;
     result.archived.push(...revokeInfo.archived);
+
+    // 阶段五：observation 提炼——默认走 pool 路径（重写入口在 pool-pass 的池排空之后），
+    // legacy 回滚口子也接一次，保证两种调度下行为一致。失败只记日志；
+    // 观察是派生数据，不计入本轮 changed / lastSleepAt 水位，原有语义不变。
+    let observe: ObservationPassOutcome | null = null;
+    try {
+      observe = await runObservationPass(
+        {
+          store: store as unknown as ObservationPassStore,
+          cfg,
+          log: (line) => log(cfg, line),
+          model: env.model,
+          owner: env.sleepOwner,
+        },
+        { dryRun },
+      );
+      result.observe = observe;
+    } catch (error) {
+      log(cfg, `[observe] WARN 整段失败（不影响本轮睡觉）：${(error as Error | null)?.message || error}`);
+    }
 
     const changed =
       result.added.length + result.merged.length + result.updated.length + result.archived.length;

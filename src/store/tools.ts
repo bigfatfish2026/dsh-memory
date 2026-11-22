@@ -8,6 +8,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { assertMayWrite } from '../write-guard.js';
 import { needsSplitText, clampLogLine } from '../text-limit.js';
 import { enqueueSplitItem } from '../split-queue.js';
+import { observationEvidence } from './observation-records.js';
 import { normalizeType } from './types.js';
 import { brief, logStore, recallSessionInfo } from './log.js';
 import type { ToolDefinition, ToolRunContext } from '@deepseek-ai/dsh-tools';
@@ -87,6 +88,11 @@ interface ReflectOutputValue {
   text: string;
 }
 
+/** memory_entity 的一条：observation 额外带证据 id（渲染层拼「证据：…」用）。 */
+interface EntityOutputItem extends EntityViewItem {
+  evidence?: string[];
+}
+
 interface EntityOutputValue {
   name: string;
   total: number;
@@ -95,7 +101,7 @@ interface EntityOutputValue {
   opinion: number;
   observation: number;
   avgConfidence?: number;
-  items: EntityViewItem[];
+  items: EntityOutputItem[];
 }
 
 function saveParameters(cfg: StoreConfig) {
@@ -522,6 +528,7 @@ function registerEntityTool(ctx: ToolContextLike, store: MemoryStore): void {
                   text: { type: 'string', required: true },
                   confidence: { type: 'number' },
                   date: { type: 'string', required: true },
+                  evidence: { type: 'array', items: { type: 'string' } },
                 },
               },
             },
@@ -533,12 +540,25 @@ function registerEntityTool(ctx: ToolContextLike, store: MemoryStore): void {
             `「${value.name}」共 ${value.total} 条：world ${value.world} / experience ${value.experience}` +
             ` / opinion ${value.opinion} / observation ${value.observation}` +
             (value.avgConfidence === undefined ? '' : `，opinion 平均置信度 ${value.avgConfidence}`);
-          const body = value.items.map((it) => `· [${it.type}] ${it.text}（${it.date}）`);
+          const body = value.items.map((it) => {
+            const line = `· [${it.type}] ${it.text}（${it.date}）`;
+            // 观察要能看出结论从哪来：证据 id 只对 observation 条拼，其它类型保持原样
+            return it.type === 'observation' && it.evidence?.length
+              ? `${line}\n  证据：${it.evidence.join(', ')}（${it.evidence.length} 条独立来源）`
+              : line;
+          });
           return [{ type: 'text', text: [head, ...body].join('\n') }];
         },
       },
       async execute(args) {
         const view = store.entityView(String(args.name || ''), Number(args.limit) || 8);
+        // 证据链在这里补：observationEvidence 读 memory_link 的 derived_from 边，
+        // 库里没有边（老观察 / 缺表）就返回空数组，条目不因此消失。
+        const items: EntityOutputItem[] = view.items.map((it) => (
+          it.type === 'observation'
+            ? { ...it, evidence: observationEvidence(store.db(), it.id) }
+            : it
+        ));
         const out: EntityOutputValue = {
           name: view.name,
           total: view.total,
@@ -546,7 +566,7 @@ function registerEntityTool(ctx: ToolContextLike, store: MemoryStore): void {
           experience: view.counts.experience,
           opinion: view.counts.opinion,
           observation: view.counts.observation,
-          items: view.items,
+          items,
         };
         if (view.avgConfidence !== null) out.avgConfidence = view.avgConfidence;
         return out;

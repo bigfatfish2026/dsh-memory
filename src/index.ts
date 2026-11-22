@@ -24,6 +24,7 @@ import { selectCurateConcurrency } from './concurrency.js';
 import * as paths from './shared/paths.js';
 import { setupAutoPrefill } from './prefill.js';
 import { setupEntityQueue } from './entity-worker.js';
+import { entityGraphOf } from './entity-graph.js';
 import { assertMayWrite } from './write-guard.js';
 import { llmOf } from './llm-service.js';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -53,6 +54,18 @@ export interface MemoryConfig {
     textLint?: boolean;
     lintReview?: boolean;
     lintReviewTimeoutMs?: number;
+    /** 段级信号是否硬拒（默认 false = 只记）；阶段二才开。 */
+    splitSignalsStrict?: boolean;
+    [key: string]: unknown;
+  };
+  /** 冲突预判（decision 桥）配置；schema 在下方，默认关。 */
+  conflictDecide?: {
+    enabled?: boolean;
+    batchSize?: number;
+    minConfidence?: number;
+    timeoutMs?: number;
+    baseUrl?: string;
+    model?: string;
     [key: string]: unknown;
   };
   /** 实体队列（apply 里打启动行读这几个键）。 */
@@ -70,6 +83,17 @@ export interface MemoryConfig {
     coarseBudgetMs?: number;
     reasoningEffort?: string;
     logFile?: string;
+    [key: string]: unknown;
+  };
+  /**
+   * 实体待观察（observation）登记与夜间提炼（docs/observation-plan-v2.md §4/§6/§8）。
+   * enabled 默认 false：写路径不写 observe_task、夜间也不跑提炼，行为与加这项之前一致。
+   */
+  observe?: {
+    enabled?: boolean;
+    dryRun?: boolean;
+    maxEntities?: number;
+    maxInput?: number;
     [key: string]: unknown;
   };
   [key: string]: unknown;
@@ -160,6 +184,26 @@ export const Config: Schema<MemoryConfig> = Schema.object({
       logFile: paths.logFile('memory_entity.log'),
     }),
 
+  // ── 实体待观察（observation）登记与夜间提炼（2026-11-21，docs/observation-plan-v2.md §4/§6/§8）──
+  /**
+   * enabled：写路径（新建 / 正文改写 / 合并 / 归档 / 拆分 / 挂载晚到）是否把受影响实体登记进
+   * observe_task，以及夜间整理收尾是否跑 observation 提炼（src/sleep/observation-pass.ts）。
+   * 默认 false —— 关着时一行都不写、一次模型都不调，行为与加这项之前一致；开着但老库没跑
+   * scripts/apply-observe-schema.mjs 时队列/提炼内部缺表判定会直接跳过，不影响原写入。
+   * dryRun：提炼照跑模型、照计量，但不 claim、不落库、不改 observe_task 一个字节（对账用）。
+   * maxEntities：每轮最多领几个实体（默认 20，灰度预算见设计 §8）。
+   * maxInput：每个实体最多带几条 active world/experience 证据进 prompt（默认 30）。
+   * 召回过滤 / 复核触发 / memory_entity 渲染不在本配置范围（后续票）。
+   */
+  observe: Schema
+    .object({
+      enabled: Schema.boolean().default(false),
+      dryRun: Schema.boolean().default(false),
+      maxEntities: Schema.number().step(1).min(1).default(20),
+      maxInput: Schema.number().step(1).min(1).default(30),
+    })
+    .default({ enabled: false, dryRun: false, maxEntities: 20, maxInput: 30 }),
+
   // ── 每轮自动回忆注入（2026-11-01 加：分级触发，让「动手前先翻记忆」变成机制）──
   /** 用户消息进来时自动检索长期记忆，拼进 system prompt。 */
   autoPrefill: Schema.boolean().default(true),
@@ -226,6 +270,13 @@ export const Config: Schema<MemoryConfig> = Schema.object({
   contextWatchLogFile: Schema.string().default(paths.logFile('memory_context_watch.log')),
   /** 关掉就只发事件不推 QQ（排障用）。 */
   contextWatchNotify: Schema.boolean().default(true),
+  /**
+   * 不发压线提醒的 provider 名单（精确相等、区分大小写，口径同 modelPolicies）。
+   * 群会话走独立路由（本机 magpie-grp），群里不需要「上下文 XXk / 压缩线」提醒；
+   * 默认空 = 只按会话来源判定，行为与旧版一致。判据只看 provider：主会话的 model
+   * 同样是 group/ds，按 model 分会误伤主会话。
+   */
+  contextWatchSkipProviders: Schema.array(Schema.string()).default([]),
 
   // ── 睡觉 ──
   /**
@@ -281,6 +332,35 @@ export const Config: Schema<MemoryConfig> = Schema.object({
   contextWindowTokens: Schema.number().step(1000).min(0).default(0),
   /** 入口冲突检查：新记忆入库前按实体比对旧条，判冗余 / 状态变更 / 矛盾。2026-10-29 加 */
   conflictCheckEnabled: Schema.boolean().default(true),
+  /**
+   * 冲突预判（2026-11-20）：入口冲突检查先问本地 decision 桥
+   * （tools/gemini-decision-bridge，默认 127.0.0.1:3427/systemone），
+   * 高置信判 new 的直接放行，省掉一次生成模型调用（实测 81.1% 判 new，单次 p50 9.7s）。
+   * 默认 false —— 关着时 runConflictCheck 不发请求、日志文本与加这层之前逐字节一致；
+   * 桥失败/超时/429/答案缺 qid 一律整批退回原 askConflict，主流程无感知。
+   */
+  conflictDecide: Schema
+    .object({
+      enabled: Schema.boolean().default(false),
+      /** 一批几条；硬上限 10（批内共享 state，条数越多互相污染越重，代码里再夹一次）。 */
+      batchSize: Schema.number().step(1).min(1).default(8),
+      /** 判 new 的概率门槛：低于它退回原来的 askConflict。 */
+      minConfidence: Schema.number().min(0).max(1).default(0.9),
+      /** 单批超时（毫秒）：超时整批降级。 */
+      timeoutMs: Schema.number().step(100).min(200).default(2500),
+      /** decision 桥地址（只认 http://host:port，路径固定 /systemone）。 */
+      baseUrl: Schema.string().default('http://127.0.0.1:3427'),
+      /** 桥透传给上游的模型名。 */
+      model: Schema.string().default('gemini-decision-1'),
+    })
+    .default({
+      enabled: false,
+      batchSize: 8,
+      minConfidence: 0.9,
+      timeoutMs: 2500,
+      baseUrl: 'http://127.0.0.1:3427',
+      model: 'gemini-decision-1',
+    }),
   // 2026-11-14：conflictCheckMaxCalls（一次最多检查 20 条）删了，全部检查。
   /**
    * 候选生成方式（2026-11-06 t-graph-cluster）。
@@ -328,12 +408,19 @@ export const Config: Schema<MemoryConfig> = Schema.object({
        * 模型明确给 {"ops":[]} 的批算 noop，直接写 organizeCache，不进 pending 烧钱。
        */
       agentPipeline: Schema.boolean().default(false),
+      /**
+       * 拆分自足性段级信号（split_delimiter / split_deictic / split_premise / split_process）
+       * 是否当硬拒。默认 false = 只记日志与 signals 字段，不判废、不重问、不落 dead；
+       * 阶段二回放误杀率达标后才打开。textLint 的 warn 级违规不受这个开关影响。
+       */
+      splitSignalsStrict: Schema.boolean().default(false),
     })
     .default({
       ingestAck: false,
       writeGate: false,
       writeGateThreshold: 0.9,
       agentPipeline: false,
+      splitSignalsStrict: false,
     }),
   /**
    * 入库并发：ingest 是整轮第一段，29 个重放文件串行问模型，
@@ -516,6 +603,9 @@ export function apply(ctx: MemoryPluginContext, config: MemoryConfig): void {
   // 写入闸的模型客户端：只注入 getter，每次现取（AGENTS：别在 setup 期存 ctx.llm，
   // 重载后旧句柄会抛 inactive context）。
   store.attachLlm?.(() => llmOf(ctx, { site: 'write_gate', cfg }));
+  // observation 写侧登记：records / pipeline-split 走 state.cfg 的同一开关；
+  // entity-graph 的「挂载晚到」没有 cfg 入口，装配处按同一份配置设到每库实例（默认 false = 一行不写）。
+  entityGraphOf(store.db()).setObserveEnabled(cfg.observe?.enabled === true);
   registerStoreTools(ctx as unknown as ToolContextLike, store, cfg as StoreConfig);
   // 压线提醒跟着已有的 llm/stream 钩子走，不另开定时器；要在 setupConsolidate 之前建好。
   const contextWatch = setupContextWatch(ctx as unknown as ContextWatchCtx, cfg);

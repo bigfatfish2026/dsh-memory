@@ -15,6 +15,11 @@
 import {
   archiveMemory, listAllItems, mergeMemories, reflect, saveMemory, updateMemory,
 } from './records.js';
+import type { ArchiveOptions } from './records.js';
+import { observationEpoch, saveObservation } from './observation-records.js';
+import type { ObservationInput, ObservationOptions, ObservationResult } from './observation-records.js';
+import { activateSplitGroup, archiveSplitGroup, splitGroupOf } from './split-group.js';
+import type { SplitGroupView } from './split-group.js';
 import { recall } from './search.js';
 import { entityView } from './entities.js';
 import { createSnapshot, vecIndexOf } from './snapshot.js';
@@ -211,8 +216,26 @@ export class MemoryStore {
     return updateMemory(this.#state, id, patch || {});
   }
 
-  archive(id: string, reason?: string): Promise<SavedRecord | DiscardedRecord> {
-    return archiveMemory(this.#state, id, reason);
+  archive(id: string, reason?: string, opts?: ArchiveOptions): Promise<SavedRecord | DiscardedRecord> {
+    return archiveMemory(this.#state, id, reason, opts);
+  }
+
+  /**
+   * 拆分组：按 source 键读整组现状（以库为准）。收尾判定不许只看本次调用的返回值，
+   * 否则重启 / 回队 / 重试之后已经落库的段就认不出来了。
+   */
+  splitGroupOf(source: string): SplitGroupView {
+    return splitGroupOf(this.#state, source);
+  }
+
+  /** 整组转 active（一笔事务）。只动 pending_split 行，父条与别的组不受影响。 */
+  activateSplitGroup(ids: string[]): number {
+    return activateSplitGroup(this.#state, ids);
+  }
+
+  /** 半成品整组归档（一笔事务），reason 固定 partial-split；组键与 splitGroup 标记保留。 */
+  archiveSplitGroup(ids: string[], reason?: string): number {
+    return archiveSplitGroup(this.#state, ids, reason);
   }
 
   merge(ids: unknown, text: unknown, tags: unknown, meta?: RecordMeta): Promise<SavedRecord | DiscardedRecord> {
@@ -221,6 +244,26 @@ export class MemoryStore {
 
   reflect(id: string, signal: unknown): Promise<SavedRecord | DiscardedRecord> {
     return reflect(this.#state, id, signal);
+  }
+
+  /**
+   * observation 专用写入（绕开写入闸，正文 + 证据边一笔事务）。
+   * 实现与理由见 src/store/observation-records.ts。
+   */
+  saveObservation(input: ObservationInput, opts?: ObservationOptions): Promise<ObservationResult> {
+    return saveObservation(this.#state, input, opts || {});
+  }
+
+  /**
+   * 观察版本号（meta.observation_epoch）：prefill 的注入缓存按它失效。
+   * 观察写入事务里 +1；老库没这个键、缺 meta 表都按 0 返回，不影响注入。
+   */
+  observationVersion(): number {
+    try {
+      return observationEpoch(this.#state.connect());
+    } catch {
+      return 0;
+    }
   }
 
   entityView(name: unknown, limit?: number): EntityView {

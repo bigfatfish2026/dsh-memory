@@ -75,10 +75,12 @@ export interface PrefillLogFields {
   ms?: number;
 }
 
-/** prefill 用到的 store 面：召回 + 全表（补 id 用）。 */
+/** prefill 用到的 store 面：召回 + 全表（补 id 用）+ 观察版本（缓存失效用）。 */
 export interface PrefillStore {
   recall: (query: string, k: number, opts?: Record<string, unknown>) => Promise<RecallItem[]>;
   listAll?: () => Array<{ id?: string | number; text?: unknown }>;
+  /** 每库一份的观察版本号（meta.observation_epoch）；缺这个方法的假 store 按 0 处理。 */
+  observationVersion?: () => number;
 }
 
 /** system-prompt/assemble 的上下文面。 */
@@ -565,7 +567,18 @@ export function setupAutoPrefill(ctx: PrefillCtx, store: PrefillStore, cfg: Pref
                 reason = judge.reason;
                 // 召回词：先剔掉整行括号包裹的 harness 指令行（剔空了回退原文），再截断
                 const query = recallQuery(raw);
-                const key = `${sessionId}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}`;
+                // 缓存 key = 会话 + 消息原文 hash + 观察版本号。
+                // 观察写入（saveObservation）在写事务里把 meta.observation_epoch +1，
+                // 版本一变旧 key 就不再命中，等价于「命中前比版本」；不需要另建失效接口，
+                // 也不会被普通记忆写入误伤（那些不动观察版本）。读不到版本就退 0，
+                // 只影响失效灵敏度，绝不影响注入本身。
+                let epoch = 0;
+                try {
+                  epoch = Number(store.observationVersion?.() ?? 0) || 0;
+                } catch {
+                  epoch = 0;
+                }
+                const key = `${sessionId}:${createHash('sha256').update(raw).digest('hex').slice(0, 16)}:${epoch}`;
                 const cached = cacheGet(key);
                 // 缓存优先：同一回合里多步工具循环会反复 assemble，
                 // 同一条消息必须每次都注入同一段文本，否则提示词前缀每步都变。
