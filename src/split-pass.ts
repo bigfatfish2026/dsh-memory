@@ -31,6 +31,10 @@ import {
 import { SELF_CONTAINED_RULES, SPLIT_RULES } from './lint-prompt.js';
 import { recordLintRejects } from './lint-reject.js';
 import { ensureDir, ensureDirFor } from './shared/fs.js';
+import {
+  PARTIAL_SPLIT_REASON, PENDING_SPLIT_STATUS, pendingSplitIds, splitGroupFromRecords, splitGroupGap,
+} from './store/split-group.js';
+import type { SplitGroupView } from './store/split-group.js';
 
 const TYPES = ['world', 'experience', 'opinion', 'observation'];
 
@@ -67,10 +71,50 @@ export interface SplitState {
 /** split-pass 用到的 store 面：快照、写库、归档、备份、db。 */
 export interface SplitStore {
   listAll: () => MemoryRecord[];
+  metas?: () => MemoryRecord[];
   db?: () => DatabaseSync;
   save: (text: string, tags: string[] | undefined, source: string, extra: Record<string, unknown>) => Promise<{ id?: string | number }>;
-  archive: (id: string, reason: string) => Promise<unknown>;
+  archive: (id: string, reason: string, opts?: { supersededBy?: string; childValidFrom?: string; childTs?: string }) => Promise<unknown>;
+  /** 整组转 active（一笔事务）；MemoryStore 有，假 store 可省。 */
+  activateSplitGroup?: (ids: string[]) => number | Promise<number>;
+  /** 半成品整组归档（一笔事务），reason 固定 partial-split。 */
+  archiveSplitGroup?: (ids: string[], reason?: string) => number | Promise<number>;
+  /** 假 store 没有批量组接口时的逐条退路。 */
+  update?: (id: string, patch?: Record<string, unknown>) => Promise<unknown>;
   backupTo?: (file: string) => Promise<unknown>;
+}
+
+/** 阶段三的组键：源列固定写 'split'（历史口径与查询都靠它），组键只能放 extra.splitGroup。 */
+export function splitPassGroupKey(sourceId: string | number): string {
+  return `split:${String(sourceId || '').trim()}`;
+}
+
+async function activateGroupOf(store: SplitStore, ids: string[]): Promise<number> {
+  if (!ids.length) return 0;
+  if (typeof store.activateSplitGroup === 'function') return Number(await store.activateSplitGroup(ids)) || 0;
+  if (typeof store.update === 'function') {
+    let n = 0;
+    for (const id of ids) {
+      await store.update(id, { status: 'active' });
+      n += 1;
+    }
+    return n;
+  }
+  return 0;
+}
+
+async function archiveGroupOf(store: SplitStore, ids: string[], reason: string = PARTIAL_SPLIT_REASON): Promise<number> {
+  if (!ids.length) return 0;
+  if (typeof store.archiveSplitGroup === 'function') return Number(await store.archiveSplitGroup(ids, reason)) || 0;
+  if (typeof store.update === 'function') {
+    let n = 0;
+    for (const id of ids) {
+      await store.update(id, { status: 'archived', reason });
+      n += 1;
+    }
+    return n;
+  }
+  return 0;
 }
 
 /** split-pass 读到的配置面。 */
@@ -130,7 +174,7 @@ export interface SplitPassResult {
 const SYSTEM = `你在整理长期记忆。给你一条记忆，把它拆成若干条「一条只说一件事」的原子条目。
 
 硬规则：
-- 每条 30~200 字，最长不超过 200 字。主谓宾完整，单独拿出来就能看懂，不要「上述」「该方案」「它」这类指代。
+- 每条 30~200 字，最长不超过 200 字。主谓宾完整，单独拿出来就能看懂，不要以「这/该/它/此/那/上述/上面/这份/本文件/该目录/这个仓库/这个插件」开头，要写具体对象。
 - 一条只讲一件事：一个事实、一个决定、一次故障、一条偏好、一个数字。
 - 类型从严判（Hindsight 四类，每条只能选一个）：
   world = 外部客观事实：机器状态、配置、文件路径、别人说过的话、某个结论。
@@ -144,6 +188,7 @@ const SYSTEM = `你在整理长期记忆。给你一条记忆，把它拆成若�
 - 不许新增原文没有的事实，不许把推测写成结论。
 - 自称一律写具体的执行者名字或「维护者」，不要写「我」。原文是谁做的事，条目主语就写谁。
 - 拆完自查一遍：原文里的每个路径、命令、数字、报错原文、阈值，都必须在某一条里出现过；漏了就补一条，不要为了条数好看丢东西。
+- 整条只是过程性状态（本轮、本轮工具不可用、这次失败），返回空 items，不要硬造条目。
 - 条目数不设上限，原文塞了多少件事就拆多少条。
 
 输出一个 JSON 对象，不要解释、不要代码块：
@@ -460,6 +505,14 @@ export async function runSplitPass({
       }
 
       const savedIds: Array<string | number> = [];
+      /** 本次直写落库的段 id（中间态）：失败/不完整时整组归档成 partial-split。 */
+      const groupIds: string[] = [];
+      /** 判重承接的段下标：判重没有新行，组完整性靠它补位。 */
+      const dedupedIndexes: number[] = [];
+      // 阶段三的组键：源列保持 'split'（历史查询都靠它），组键放 extra.splitGroup.source。
+      const groupKey = splitPassGroupKey(source.id);
+      // 本组应有几段：只在这次直写里落库的短段；超长段进 pending_ops，归 pipeline-split 那一组。
+      const localItems = normalized.filter((item) => !(item.tooLong || String(item.text || '').length > MEMORY_TEXT_MAX));
       let enqueued = 0;
       for (const item of normalized) {
         // 超长子段不丢：原样入 pending_ops(kind='split_item') 继续拆，源条保持 active。
@@ -488,23 +541,69 @@ export async function runSplitPass({
           }
           continue;
         }
-        const rec = await store.save(item.text, source.tags, 'split', {
-          // 复核判 keep（误杀）的条目带 __lintChecked 过 store 最后一道闸，原样入库
-          ...lintReviewMeta(item),
-          type: item.type,
-          entities: item.entities,
-          validFrom: item.validFrom,
-          confidence: item.confidence,
-          supersedes: [source.id],
-        });
-        // 2026-11-05：写入闸判 DUPLICATE 时 rec.id 为空，别把 null 塞进状态，也别白归档源条
-        if (!rec.id) {
-          deduped += 1; // 判重丢掉的子段，写入闸已在 discards 落了一行账
-          continue;
+        const partIndex = localItems.indexOf(item);
+        try {
+          const rec = await store.save(item.text, source.tags, 'split', {
+            // 复核判 keep（误杀）的条目带 __lintChecked 过 store 最后一道闸，原样入库
+            ...lintReviewMeta(item),
+            type: item.type,
+            entities: item.entities,
+            validFrom: item.validFrom,
+            confidence: item.confidence,
+            // 写入即中间态：同一笔 save 事务落 pending_split，整组齐了才激活（2026-11-22）。
+            // 阶段三与 pipeline-split 走同一套口径，别让两条直写路径行为不一致。
+            status: PENDING_SPLIT_STATUS,
+            __splitGroup: { source: groupKey, expected: localItems.length, index: partIndex },
+            // 原条只排除出写入闸召回，不建立取代关系；supersededBy/validTo 由下面的 archive 同一笔事务写
+            __gateExclude: [source.id],
+          });
+          // 2026-11-05：写入闸判 DUPLICATE 时 rec.id 为空，别把 null 塞进状态，也别白归档源条
+          if (!rec.id) {
+            deduped += 1; // 判重丢掉的子段，写入闸已在 discards 落了一行账
+            dedupedIndexes.push(partIndex);
+            continue;
+          }
+          inserted += 1;
+          savedIds.push(rec.id);
+          groupIds.push(String(rec.id));
+        } catch (error) {
+          // 单段落库失败：本条源不归档，已落的 pending 段整组归档，别留半截残句在库里
+          const cleaned = await archiveGroupOf(store, groupIds);
+          appendLog(
+            logFile,
+            `[split] WARN 子段入库失败 id=${source.id} part=${partIndex}：${(error as Error)?.message || error}；` +
+              `已落 ${cleaned} 段归档 reason=${PARTIAL_SPLIT_REASON}`,
+          );
+          throw error;
         }
-        inserted += 1;
-        savedIds.push(rec.id);
       }
+      // 组完整性：短段这一组要盖满 localItems；超长段在另一个组里由消费端收尾，不影响这里激活。
+      // 组视图里一行都认不出来（假 store 不写 source / 老注入面）时退回本次落库账，不能凭空判不完整。
+      const groupView: SplitGroupView | null = typeof store.metas === 'function'
+        ? splitGroupFromRecords(store.metas(), groupKey)
+        : null;
+      const groupGap = groupView && groupView.rows.length
+        ? splitGroupGap(groupView, localItems.length, dedupedIndexes)
+        : {
+          complete: savedIds.length + dedupedIndexes.length >= localItems.length,
+          expected: localItems.length,
+          have: savedIds.length + dedupedIndexes.length,
+          missing: [] as number[],
+        };
+      const closeIds = groupView && groupView.rows.length ? pendingSplitIds(groupView) : groupIds;
+      if (!groupGap.complete) {
+        const cleaned = await archiveGroupOf(store, closeIds);
+        appendLog(
+          logFile,
+          `[split] WARN 组不完整 id=${source.id} ${groupGap.have}/${localItems.length}` +
+            (groupGap.missing.length ? ` missing=${groupGap.missing.join(',')}` : '') +
+            `；半成品 ${cleaned} 段归档 reason=${PARTIAL_SPLIT_REASON}，源条保持 active`,
+        );
+        details.push({ id: source.id, action: 'error', reason: `split_group_incomplete:${groupGap.have}/${localItems.length}` });
+        continue;
+      }
+      const activated = await activateGroupOf(store, closeIds);
+      if (activated) appendLog(logFile, `[split] 组 ${groupKey} 齐 ${localItems.length}/${localItems.length}，激活 ${activated} 段`);
       // 只要还有超长子段在队列里，就不归档源条：等拆分消费端处理完再归档，
       // 避免短段已入库、长段还在队列时原条被提前作废。源条保持 active。
       if (enqueued > 0) {
@@ -516,7 +615,11 @@ export async function runSplitPass({
         appendLog(logFile, `写入闸全判重，源条保留 id=${source.id}`);
         continue;
       }
-      await store.archive(source.id, `拆成 ${savedIds.length} 条：${savedIds.join(',')}`);
+      await store.archive(source.id, `拆成 ${savedIds.length} 条：${savedIds.join(',')}`, {
+        supersededBy: String(savedIds[savedIds.length - 1]),
+        childValidFrom: String(source.validFrom || ''),
+        childTs: String(source.ts || ''),
+      });
       archived += 1;
       state.ids[source.id] = { ts: Date.now(), into: savedIds, n: savedIds.length };
       writeState(stateFile, state);

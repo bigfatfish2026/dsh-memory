@@ -110,7 +110,10 @@ function makeStoreStub(db, { memories = [], delayMs = 1 } = {}) {
     try {
       if (delayMs) await new Promise((r) => setTimeout(r, delayMs));
       writes.push({ kind, text: String(text || '') });
-      return { id: `new_${++seq}`, text, tags: [], type: 'world', status: 'active', entities: [] };
+      const rec = { id: `new_${++seq}`, text, tags: [], type: 'world', status: 'active', entities: [] };
+      // 跟真 store 一样：save 落库后 metas 立刻能查到，覆盖校验要靠它按 id 核对承接
+      if (kind === 'save' && String(text || '').trim()) memories.push({ ...rec, __vec: [1, 0, 0, 0] });
+      return rec;
     } finally {
       inFlight -= 1;
     }
@@ -126,7 +129,12 @@ function makeStoreStub(db, { memories = [], delayMs = 1 } = {}) {
     save: (text) => track('save', text),
     merge: (_ids, text) => track('merge', text),
     update: (id, text) => track('update', text),
-    archive: (id, reason) => track('archive', `${id} ${reason}`),
+    // 跟真 store 一样：归档要落状态，拆分 done 前的复核会重新读父条 status
+    archive: (id, reason) => {
+      const rec = memories.find((m) => String(m.id) === String(id));
+      if (rec) rec.status = 'archived';
+      return track('archive', `${id} ${reason}`);
+    },
   };
 }
 

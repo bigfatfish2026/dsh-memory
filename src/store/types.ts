@@ -121,6 +121,12 @@ export interface RecordMeta {
   __vector?: ArrayLike<number> | null;
   __gateChecked?: boolean;
   __archive?: unknown;
+  /** 只排除出写入闸召回、不建立取代关系（拆分子段用：原条不许把子段判成 DUPLICATE）。 */
+  __gateExclude?: unknown;
+  /** 新条落库时的初始状态；不给就是 active。拆分子段用它写中间态 pending_split。 */
+  status?: string;
+  /** 拆分子段的组标记（source/expected/index），落进 extra，整组收尾时按它核对。 */
+  __splitGroup?: { source: string; expected: number; index: number };
   [key: string]: unknown;
 }
 
