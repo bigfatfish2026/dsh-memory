@@ -160,6 +160,49 @@ test('undo：按 entity_merge 把 surface 与挂载搬回 src，src 回 active',
   db.close();
 });
 
+// 票 t-mwogaszr-3h6t：memory_entity.status 曾长期写空串（写侧字面量 ''）。
+// 读侧口径统一成 COALESCE(NULLIF(status,''),'active')，搬挂载时不许把空串搬成新行。
+const emptyStatusRows = (db) => Number(db.prepare("SELECT count(*) AS n FROM memory_entity WHERE status=''").get()?.n || 0);
+
+test('老行 status 空串：合并搬挂载时按 active 搬，evidence 里也不留空串', () => {
+  const db = freshDb();
+  seed(db);
+  db.prepare("UPDATE memory_entity SET status='' WHERE entity_id=2").run();
+  assert.equal(emptyStatusRows(db), 1, '先确认样本确实是空串');
+
+  const { auto } = scanEntityTidy(db);
+  const out = applyEntityTidy(db, { plan: auto, runId: 't-empty' });
+  assert.equal(out.merged, 1);
+  assert.equal(emptyStatusRows(db), 0, "搬完不许还有 status=''");
+  const moved = db.prepare("SELECT status FROM memory_entity WHERE entity_id=1 AND memory_id='m_3'").get();
+  assert.equal(moved.status, 'active', '搬过去的行 status 读作 active');
+
+  const evidence = JSON.parse(String(db.prepare('SELECT evidence FROM entity_merge').get().evidence));
+  const statuses = evidence.mounts.map((m) => m.status);
+  assert.deepEqual(statuses, ['active'], '快照里记 active，不记空串');
+  db.close();
+});
+
+test('老 evidence 里 status 是空串：undo 写回时补成 active', () => {
+  const db = freshDb();
+  seed(db);
+  const { auto } = scanEntityTidy(db);
+  applyEntityTidy(db, { plan: auto, runId: 't-legacy' });
+
+  // 模拟修复前落下的凭据：evidence.mounts 里的 status 是空串快照
+  const row = db.prepare('SELECT id, evidence FROM entity_merge').get();
+  const ev = JSON.parse(String(row.evidence));
+  ev.mounts = ev.mounts.map((m) => ({ ...m, status: '' }));
+  db.prepare('UPDATE entity_merge SET evidence=? WHERE id=?').run(JSON.stringify(ev), Number(row.id));
+
+  const undo = undoEntityMerge(db);
+  assert.equal(undo.ok, true);
+  assert.equal(emptyStatusRows(db), 0, 'undo 不许把空串搬回来');
+  const back = db.prepare("SELECT status FROM memory_entity WHERE entity_id=2 AND memory_id='m_3'").get();
+  assert.equal(back.status, 'active', '搬回 src 的行 status 是 active');
+  db.close();
+});
+
 test('缓存失效：entity_surface_epoch 变了，surface 缓存必须重读', () => {
   const db = freshDb();
   seed(db);

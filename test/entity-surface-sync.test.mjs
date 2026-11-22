@@ -143,3 +143,17 @@ test('原文已被别的实体占用：不抢计数，落 surface_conflict', () 
   const issues = db.prepare("SELECT entity_norm, reason FROM entity_issue WHERE reason='surface_conflict'").all();
   assert.ok(issues.length >= 1, '冲突要落 entity_issue');
 });
+
+test("落库行的 status 是 'active'，不是空串", () => {
+  // 票 t-mwogaszr-3h6t：写侧 INSERT 原先写死 status=''，存量因此长到 3 万多行，
+  // 读侧一旦写 status='active' 就静默漏行。这里钉住源头（本文件 DDL 的默认值仍是 ''，
+  // 所以断言真的在查 INSERT 字面量，不是查表默认值）。
+  const db = makeDb();
+  seedEntity(db, { id: 7, norm: '树莓派' });
+  seedSurface(db, { surface: '树莓派', entityId: 7, count: 3 });
+
+  assert.equal(insertMemoryEntity(db, { memoryId: 'm1', entityId: 7, ts: TS, origin: 'rule' }), true);
+  const row = db.prepare("SELECT status FROM memory_entity WHERE memory_id='m1'").get();
+  assert.equal(row.status, 'active');
+  assert.equal(countOf(db, "SELECT count(*) n FROM memory_entity WHERE status=''"), 0, '表里不许出现空串行');
+});

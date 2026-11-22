@@ -719,7 +719,12 @@ function prepareApplyStatements(db: DatabaseSync): { stmts: TidyStmts | null; er
   const hasOrigin = memoryEntityColumns(db).has('origin');
   const stmts: TidyStmts = { hasOrigin } as TidyStmts;
   try {
-    stmts.selectMounts = db.prepare('SELECT memory_id, role, ts, status, attrs, version, prev_memory_id FROM memory_entity WHERE entity_id=?');
+    // 空串按 active 读出（口径同 entity-worker 的 COALESCE）：这一列是「搬走再插回」的搬运源，
+    // 原样搬会把老库的空串搬成新行；存量已于 2026-11-20 清洗，老 evidence 另在 undo 写回处兜底。
+    stmts.selectMounts = db.prepare(`SELECT memory_id, role, ts,
+        COALESCE(NULLIF(status, ''), 'active') AS status,
+        attrs, version, prev_memory_id
+      FROM memory_entity WHERE entity_id=?`);
   } catch (error) {
     return { stmts: null, error: `memory_entity 读不了（${String((error as { message?: unknown } | null | undefined)?.message || error)}）` };
   }
@@ -978,9 +983,11 @@ function restoreEvidenceOf(stmts: TidyUndoStmts, { src, dst, surfaces, mounts }:
   let mountRestored = 0;
   let mountSkipped = 0;
   for (const m of mounts) {
+    // evidence 里的 status 是老快照，可能是空串：写回时按 active 落，别把空串搬回来
+    const mountStatus = String(m.status || 'active');
     const ins = stmts.hasOrigin
-      ? stmts.insertMount!.run(m.memory_id, src, m.role, m.ts, m.status, m.attrs, m.version, m.prev_memory_id, 'manual')
-      : stmts.insertMount!.run(m.memory_id, src, m.role, m.ts, m.status, m.attrs, m.version, m.prev_memory_id);
+      ? stmts.insertMount!.run(m.memory_id, src, m.role, m.ts, mountStatus, m.attrs, m.version, m.prev_memory_id, 'manual')
+      : stmts.insertMount!.run(m.memory_id, src, m.role, m.ts, mountStatus, m.attrs, m.version, m.prev_memory_id);
     // dst 那边只有「src 已经立住」时才删，否则先把 dst 的行删了就把挂载弄丢了
     const dropped = Number(stmts.dropMount!.run(dst, m.memory_id, m.role).changes) || 0;
     if (Number(ins.changes) || dropped) mountRestored += 1; else mountSkipped += 1;

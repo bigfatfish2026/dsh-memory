@@ -133,7 +133,7 @@ async function runRule() {
       st.rule.matchedMems += 1;
       for (const h of hits) {
         const ent = upsertEntity(h.norm, h.norm, h.etype, {}, m.ts || '');
-        const r = insME.run(m.id, ent.id, m.ts || '', '', '{}');
+        const r = insME.run(m.id, ent.id, m.ts || '', 'active', '{}');
         if (r.changes) st.rule.pairs += 1;
       }
     }
@@ -234,7 +234,7 @@ async function runAgent() {
         if (n.etype !== 'unknown' && n.etype !== etype && !['concept'].includes(etype)) etype = n.etype;
         const attrs = (it?.attrs && typeof it.attrs === 'object') ? it.attrs : {};
         const ent = upsertEntity(n.norm, n.display || rawName, etype, attrs, m.ts || '');
-        const r = insME.run(m.id, ent.id, m.ts || '', '', JSON.stringify(attrs));
+        const r = insME.run(m.id, ent.id, m.ts || '', 'active', JSON.stringify(attrs));
         if (r.changes) st.agent.accepted += 1;
       }
       db.exec('COMMIT');

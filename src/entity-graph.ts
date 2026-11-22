@@ -23,6 +23,8 @@
  */
 import type { DatabaseSync } from 'node:sqlite';
 import { E_TYPES, foldForMatch, normalizeEntity, isGenericName } from './shared/entity-normalize.js';
+import { entityKeyOfId, notifyEntitiesChanged } from './store/observe-notify.js';
+import { reviewObservationsOnEvidenceChange } from './store/observation-review.js';
 
 /** surface 缓存里一条 norm：主 entityId + 同 norm 的其它 id + 原文写法。 */
 interface SurfaceEntry {
@@ -113,6 +115,11 @@ export interface InsertMemoryEntityOptions {
 export interface DeleteMemoryEntityOptions {
   memoryId?: string;
   origin?: string | null;
+  /**
+   * 跳过 observation 复核。正文改写 / 合并里的解挂已由 rewrite / merge 覆盖，
+   * 那两处传 true；只有独立解挂（没人接着改正文）才走默认的 unmount 复核。
+   */
+  skipReview?: boolean;
 }
 
 export const ROLES = ['about', 'subject', 'object', 'mentioned'];
@@ -128,8 +135,20 @@ export class EntityGraph {
   /** entity_surface 整表缓存；版本没变就复用。 */
   #surface: SurfaceCache | null = null;
 
+  /** 待观察登记开关（observe.enabled）；装配处按配置设，默认关 = 一行不写。 */
+  #observe = false;
+
   constructor(db: DatabaseSync) {
     this.#db = db;
+  }
+
+  /** 装配处按 cfg.observe.enabled 调；records 写路径读同一份配置，口径一致。 */
+  setObserveEnabled(on: boolean): void {
+    this.#observe = on === true;
+  }
+
+  get observeEnabled(): boolean {
+    return this.#observe;
   }
 
   get db(): DatabaseSync {
@@ -503,11 +522,13 @@ export class EntityGraph {
       /* 表不在下面 INSERT 会自己炸，交给调用方 */
     }
     const withOrigin = this.hasOriginColumn();
+    // status 落字面量 'active'，不走空串：表默认值也是 'active'，空串会让按
+    // `status='active'` 过滤的读侧静默漏行（2026-11-20 清洗了 3 万多行存量）。
     const sql = withOrigin
       ? `INSERT OR IGNORE INTO memory_entity(memory_id, entity_id, role, ts, status, attrs, version, prev_memory_id, origin)
-         VALUES (?, ?, ?, ?, '', ?, 0, '', ?)`
+         VALUES (?, ?, ?, ?, 'active', ?, 0, '', ?)`
       : `INSERT OR IGNORE INTO memory_entity(memory_id, entity_id, role, ts, status, attrs, version, prev_memory_id)
-         VALUES (?, ?, ?, ?, '', ?, 0, '')`;
+         VALUES (?, ?, ?, ?, 'active', ?, 0, '')`;
     const args = withOrigin
       ? [String(memoryId), Number(entityId), role, String(ts || ''), JSON.stringify(attrs || {}), String(origin || '')]
       : [String(memoryId), Number(entityId), role, String(ts || ''), JSON.stringify(attrs || {})];
@@ -521,6 +542,19 @@ export class EntityGraph {
         // surface 是派生数据，坏了不许回滚记忆本身；留一行给排障
         const emit = typeof log === 'function' ? log : () => {};
         emit(`[surface] 维护异常（memory_entity 已落 ${memoryId}/${entityId}，surface 可能漏记）：${String((error && (error as { message?: unknown }).message) || error)}`);
+      }
+      // 挂载晚到（docs/observation-plan-v2.md §4 / 场景 6）：agent / backfill / manual
+      // 后补的挂载也要让该实体重算观察。origin='rule' 是同步粗实体，records 写路径已按
+      // new-memory / rewrite 登记过，这里不重复，免得 reason 被覆盖成 mount-late。
+      // 调用方的事务（entity-worker 的 withTransaction + savepoint）包住这次登记，同成同败。
+      if (this.#observe && origin !== 'rule') {
+        const key = entityKeyOfId(db, entityId);
+        if (key) {
+          notifyEntitiesChanged(db, [key], 'mount-late', {
+            log: typeof log === 'function' ? log : undefined,
+            entityIdByKey: new Map([[key, String(Number(entityId))]]),
+          });
+        }
       }
     }
     return inserted;
@@ -538,7 +572,7 @@ export class EntityGraph {
    * 一次，别把一条记忆记成两次。surface 没有对应行（老库/冲突行）就静默跳过。
    * @returns {number} 实际删掉的行数
    */
-  deleteMemoryEntity({ memoryId, origin = null }: DeleteMemoryEntityOptions = {}): number {
+  deleteMemoryEntity({ memoryId, origin = null, skipReview = false }: DeleteMemoryEntityOptions = {}): number {
     const db = this.#db;
     const byOrigin = origin !== null && origin !== undefined;
     let rows: Array<{ entity_id: number }> = [];
@@ -564,6 +598,18 @@ export class EntityGraph {
     for (const row of rows) {
       this.bumpEntityMemCount(row.entity_id, -1);
       this.bumpSurfaceCount(row.entity_id, -1);
+    }
+    // 独立解挂：这条记忆与实体的关系没了，引用它的自动观察转 pending_review 等复核。
+    // 正文改写 / 合并里的解挂由调用方传 skipReview=true 跳过，别和 rewrite / merge 重复触发。
+    if (!skipReview && removed > 0 && memoryId) {
+      try {
+        reviewObservationsOnEvidenceChange(db, {
+          kind: 'unmount',
+          evidenceIds: [String(memoryId)],
+        });
+      } catch {
+        // 复核是派生的，不许把解挂本身带崩
+      }
     }
     return removed;
   }

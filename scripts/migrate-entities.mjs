@@ -110,7 +110,9 @@ for (;;) {
       }
       if (!perMem.size) continue;
       const ts = r.ts || '';
-      const st = r.status || '';
+      // memories.status：NULL / ''（活跃）读作 'active'，archived / merged 原样带过去。
+      // 别把空串写进 memory_entity.status——读侧按 status='active' 过滤时会静默漏行。
+      const st = String(r.status ?? '').trim() || 'active';
       for (const [norm, info] of perMem) {
         stats.pairCount += 1;
         const attrsJson = JSON.stringify(info.attrs || {});
