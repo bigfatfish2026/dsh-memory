@@ -342,10 +342,22 @@ async function replay({ sessions, db, limit, since, baselineRepeats = 1 }) {
     const b2 = baselines[1] ? baselines[1][index] : null;
     return {
       file: b.file,
-      baseline: { calls: b.calls, input: b.input, output: b.output, cacheRead: b.cacheRead, actions: countOf(b.signature), signature: b.signature },
-      budget: { calls: n.calls, input: n.input, output: n.output, cacheRead: n.cacheRead, actions: countOf(n.signature), signature: n.signature },
+      baseline: {
+        calls: b.calls, input: b.input, output: b.output, cacheRead: b.cacheRead,
+        toolCalls: b.toolCalls, compactions: b.compactions, guardStops: b.guardStops,
+        actions: countOf(b.signature), signature: b.signature,
+      },
+      budget: {
+        calls: n.calls, input: n.input, output: n.output, cacheRead: n.cacheRead,
+        toolCalls: n.toolCalls, compactions: n.compactions, guardStops: n.guardStops,
+        actions: countOf(n.signature), signature: n.signature,
+      },
       ...(b2 ? {
-        baseline2: { calls: b2.calls, input: b2.input, output: b2.output, cacheRead: b2.cacheRead, actions: countOf(b2.signature), signature: b2.signature },
+        baseline2: {
+          calls: b2.calls, input: b2.input, output: b2.output, cacheRead: b2.cacheRead,
+          toolCalls: b2.toolCalls, compactions: b2.compactions, guardStops: b2.guardStops,
+          actions: countOf(b2.signature), signature: b2.signature,
+        },
         sameConclusionBaseline2: sameStructure(b.signature, b2.signature),
         sameTextsBaseline2: sameSignature(b.signature, b2.signature),
       } : {}),
