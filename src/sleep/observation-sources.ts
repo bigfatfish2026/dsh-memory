@@ -129,26 +129,55 @@ export const BINDING_REVIEW_WORD_LEN = 3;
 /**
  * 句子级「顺带提及」判据（2026-11-23 t-mwszo23a-iwxs）。
  *
- * 整词 + 长度够只说明「正文里出现过这个词」，不说明这句话在讲它。命中所在句子带否定 /
- * 排除 / 对比语气时（「本轮只修水泵，未检查 Redis。」），只是顺口带一句，不能当主题命中
- * 直接放行——降级为待复核（ambiguous），既不直接拒也不直接放行。
+ * 整词 + 长度够只说明「正文里出现过这个词」，不说明这句话在讲它：
+ *   - 否定语气（未/没有/没检查…）只认**命中所在分句**：同句别的分句里的「没有向量」不能算；
+ *   - 排除/对比语气（除 X 外、而非、而不是、排除…）跨分句连接，按整句判；
+ *   - 「只修 X」范围声明与「一句里多个候选实体」也按整句判（t6 的
+ *     「本轮只修水泵，未检查 Redis。」里，范围声明在另一个分句、照样要降级）。
+ * 命中只是顺口带一句时降级为待复核（ambiguous），既不直接拒也不直接放行。
  *
  * 只加严：这些规则只把 ambiguous 从 false 抬到 true，不改 exact / prefix 命中，也不放宽
  * 任何长度/定位判据。
  */
-export const MENTION_NEGATION_RE = /未(?!来|成年)|没(?:有|检查|查|测|改|修|动|碰|处理|涉及|确认|验证|看|核对|跟进|管|用|做)|不是|并非|而非|而不是|除了|除[^。！？；\n]{0,24}外|排除|不算/;
+export const MENTION_NEGATION_RE = /未(?!来|成年)|没(?:有|检查|查|测|改|修|动|碰|处理|涉及|确认|验证|看|核对|跟进|管|用|做)/;
+/** 排除 / 对比语气：跨分句连接，按整句判。 */
+export const MENTION_CONTRAST_RE = /不是|并非|而非|而不是|排除|除外|不算/;
 /** 「只修 X」这类范围声明：本句在讲处理/修理的对象，别的词只是被拿来对照。 */
 export const MENTION_SCOPE_RE = /只(?:修|改|动|碰|处理|管|查|看|测|负责|涉及|覆盖|针对)/;
 /** 断句符：句号类 + 分号 + 换行。逗号不算句界（「只修水泵，未检查 Redis」还得在同一句里）。 */
 const SENTENCE_BREAK = /[。！？!?；;\n]/;
+/** 分句符：命中所在分句才算「这句话在说它」，否定词不跨分句借。 */
+const CLAUSE_BREAK = /[，,、：:]/;
+/** 「除 X 外」这类排除结构；后接「还有/也/都…」时是补充列举，不是排除。 */
+const EXCLUSION_RE = /除[^。！？；\n]{0,24}?(?:以外|外)|除了/g;
+
+/** 从命中位置向两侧找边界，返回窗口里的那段文本。 */
+function spanAt(text: string, at: number, isBreak: (ch: string) => boolean): string {
+  let from = Math.max(0, Math.min(at, text.length));
+  while (from > 0 && !isBreak(text[from - 1])) from -= 1;
+  let to = Math.max(0, Math.min(at, text.length));
+  while (to < text.length && !isBreak(text[to])) to += 1;
+  return text.slice(from, to);
+}
 
 /** 命中位置所在的整句（按 SENTENCE_BREAK 切）。 */
 function sentenceAt(text: string, at: number): string {
-  let from = Math.max(0, Math.min(at, text.length));
-  while (from > 0 && !SENTENCE_BREAK.test(text[from - 1])) from -= 1;
-  let to = Math.max(0, Math.min(at, text.length));
-  while (to < text.length && !SENTENCE_BREAK.test(text[to])) to += 1;
-  return text.slice(from, to);
+  return spanAt(text, at, (ch) => SENTENCE_BREAK.test(ch));
+}
+
+/** 命中位置所在的分句（按 SENTENCE_BREAK + CLAUSE_BREAK 切）。 */
+function clauseAt(text: string, at: number): string {
+  return spanAt(text, at, (ch) => SENTENCE_BREAK.test(ch) || CLAUSE_BREAK.test(ch));
+}
+
+/** 「除 X 外」是不是真排除：后面紧跟「还有/也/都…」是补充列举，不算排除。 */
+function hasExclusion(text: string): boolean {
+  for (const m of text.matchAll(EXCLUSION_RE)) {
+    const rest = text.slice((m.index ?? 0) + m[0].length).trim();
+    if (/^(?:还有|也|都|均|另|仍|同样|以及)/.test(rest)) continue;
+    return true;
+  }
+  return false;
 }
 
 /** 同一句里还出现了哪些别的候选实体词（整词、长度 ≥2）；空数组表示不歧义。 */
@@ -507,7 +536,10 @@ export function evidenceBindingOf(record: MemoryRecord, norm: string, options: E
   if (locateContextOf(text, at, key.length) < BINDING_MIN_LOCATE_CONTEXT) reasons.push('snippet_too_short');
   // 句中语气：顺带提及（否定/排除/对比/只修 X）不是主题命中，降级交复核。
   const sentence = sentenceAt(text, at);
-  if (MENTION_NEGATION_RE.test(sentence)) reasons.push('negated_mention');
+  // 否定只认命中所在分句：同句别的分句里「没有向量」不该把 vec_items 判成顺带提及。
+  if (MENTION_NEGATION_RE.test(clauseAt(text, at))) reasons.push('negated_mention');
+  // 排除/对比跨分句连接（「队列用 Redis，而非 Memcached」），按整句判。
+  if (MENTION_CONTRAST_RE.test(sentence) || hasExclusion(sentence)) reasons.push('negated_mention');
   if (MENTION_SCOPE_RE.test(sentence)) reasons.push('scope_limited_mention');
   if (otherCandidatesIn(sentence, key, options.candidates).length) reasons.push('multiple_entities_in_sentence');
   return {

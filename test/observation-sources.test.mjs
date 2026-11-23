@@ -362,3 +362,41 @@ test('句子级顺带提及：否定/排除/对比/只修 X 降级为待复核�
   assert.equal(hit.basis.ambiguous, true);
   assert.match(hit.basis.ambiguousReason, /multiple_entities_in_sentence/);
 });
+
+test('句子判据精度：否定不跨分句、「除…外还有」不算排除（t6 六条历史证据）', () => {
+  // m_mw68mbxl_7qy0 同形：vec_items 在讲统计，「没有向量」是另一个分句在讲 orphan 条。
+  const stats = evidenceBindingOf(
+    { id: 'h1', text: '实测定簇：memory/memory.db 的 vec_items 共 5308 条 1024 维向量，另有 3 条 orphan 没有向量。', entities: [] },
+    'vec_items',
+  );
+  assert.equal(stats.rule, 'text');
+  assert.equal(stats.ambiguous, false, '同句别的分句里的否定不许借到命中上');
+
+  // m_mw6wqdv0_yr0e 同形：「除 memories 表外还有 vec_items」是补充列举，不是排除。
+  const enumerated = evidenceBindingOf(
+    { id: 'h2', text: 'memory.db 中除 memories 表外还有 vec_items 向量表与 vec_map（rowid 对应记忆 id）；库里没有 FOREIGN KEY。', entities: [] },
+    'vec_items',
+  );
+  assert.equal(enumerated.ambiguous, false, '「除 X 外还有 Y」是在讲 Y，不许当排除');
+
+  // m_mw3j1rsi_phwx 同形：否定在别的分句，duplicate 这句本身是主题。
+  const dup = evidenceBindingOf(
+    { id: 'h3', text: 'store.js 的 mergeMemories 调写闸时没传 excludeIds，合并结果必然和自己的成员撞 DUPLICATE（22/22 全灭）。', entities: [] },
+    'duplicate',
+  );
+  assert.equal(dup.rule, 'text');
+  assert.equal(dup.ambiguous, false, '否定在另一个分句，不误伤 duplicate 命中');
+
+  // m_mwqwi7bj_cajm 同形：命中分句干净，「根本没有」在冒号后的另一分句。
+  const dup2 = evidenceBindingOf(
+    { id: 'h4', text: '报这个错是因为走 DUPLICATE 分支、库里已有等价条」的解释对不上：这四组库里根本没有等价新条。', entities: [] },
+    'duplicate',
+  );
+  assert.equal(dup2.ambiguous, false);
+
+  // m_mw3j1ry3_n3y5 阴性对照：正文里没有 duplicate 整词，照旧拒绝（basis=null）。
+  assert.equal(evidenceBindingOf(
+    { id: 'h5', text: '改成 merge 时把本批全部源 ids（含被合并的旧 id 和 supersedes 点名的 id）都放进 excludeIds。', entities: [] },
+    'duplicate',
+  ), null);
+});
