@@ -333,3 +333,26 @@ test('memory_link 缺表：观察行照写，证据边跳过', async () => {
   assert.ok(rowOf(store, res.id));
   assert.deepEqual(observationEvidence(store.db(), res.id), []);
 });
+
+test('句子级顺带提及：同一句带否定/只修范围的证据转 pending_review（t-mwszo23a-iwxs）', async () => {
+  const { store } = makeStore();
+  // 真库同形：老证据实体列为空，正文只是顺口提了一句 Redis。
+  const saved = await store.save('本轮只修水泵，未检查 Redis。', ['infra'], 'agent', {
+    type: 'world', entities: [],
+  });
+  assert.ok(!saved.discarded, '证据必须落库成功');
+
+  const res = await store.saveObservation({
+    text: 'Redis 与水泵的联动结论待复核',
+    entities: ['redis'],
+    evidenceIds: [saved.id],
+  });
+
+  assert.equal(res.created, true);
+  assert.equal(res.status, 'pending_review', '顺带提及不直接放行：初态进待复核');
+  assert.deepEqual(res.pendingReviewEvidence, [saved.id]);
+  const row = rowOf(store, res.id);
+  assert.equal(String(row.status), 'pending_review');
+  assert.equal(JSON.parse(row.extra).needsModelReview, true, '复核链路靠这个标记决定要不要问模型');
+  assert.equal(edgesOf(store, res.id).length, 1, '证据边照写，复核时还要用');
+});

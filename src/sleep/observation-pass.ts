@@ -345,6 +345,8 @@ interface ReviewTarget {
   id: string;
   needsModelReview: boolean;
   evidenceIds: string[];
+  /** 观察行自己的实体键：补证据时连同当前实体一起当候选集，句子级歧义才判得出来。 */
+  entityNorms: string[];
   text: string;
   confidence: number | null;
 }
@@ -390,6 +392,7 @@ function pendingObservationsOf(db: DatabaseSync, entityNorm: string): ReviewTarg
       id,
       needsModelReview: rec.needsModelReview === true,
       evidenceIds: observationEvidence(db, id),
+      entityNorms: entityKeysOf(entityList(rec.entities)),
       text: String(rec.text || ''),
       confidence: typeof rec.confidence === 'number' ? rec.confidence : null,
     });
@@ -466,7 +469,7 @@ function reviewEvidenceOf(
       if (!record || !isActive(record)) continue;
       skipIds.add(id);
       const hit = rootsMap.get(id);
-      const basis = evidenceBindingOf(record, entityNorm);
+      const basis = evidenceBindingOf(record, entityNorm, { candidates: [...target.entityNorms, entityNorm] });
       out.push({
         id,
         record,

@@ -303,3 +303,62 @@ test('evidenceBindingOf：命中依据带规则/命中词/片段/现有实体键
   assert.equal(hit.basis.rule, 'text');
   assert.match(hit.basis.snippet, /vec_items/);
 });
+
+test('句子级顺带提及：否定/排除/对比/只修 X 降级为待复核，正向命中不受影响（t-mwszo23a-iwxs）', () => {
+  // t6 给的例子：Redis 只是被拿来对照，不是这句在讲的主题。
+  const negated = evidenceBindingOf(
+    { id: 'n1', text: '本轮只修水泵，未检查 Redis。', entities: [] },
+    'redis',
+  );
+  assert.equal(negated.rule, 'text');
+  assert.equal(negated.ambiguous, true, '否定 + 只修范围：不直接放行');
+  assert.match(negated.ambiguousReason, /negated_mention/);
+  assert.match(negated.ambiguousReason, /scope_limited_mention/);
+
+  // 排除语气：「除 Redis 外都正常」也不是在讲 Redis 本身。
+  const excluded = evidenceBindingOf(
+    { id: 'n2', text: '除 Redis 外，其余服务都没重启。', entities: [] },
+    'redis',
+  );
+  assert.equal(excluded.ambiguous, true);
+  assert.match(excluded.ambiguousReason, /negated_mention/);
+
+  // 对比语气：而非 / 而不是。
+  const contrast = evidenceBindingOf(
+    { id: 'n3', text: '队列用的是 Redis，而非 Memcached。', entities: [] },
+    'redis',
+  );
+  assert.equal(contrast.ambiguous, true);
+  assert.match(contrast.ambiguousReason, /negated_mention/);
+
+  // 正向命中：同一句在讲 Redis，判据一个字都不放宽也不误伤。
+  const positive = evidenceBindingOf(
+    { id: 'p1', text: 'Redis 的内存占用涨到 2GB，值班员已扩容。', entities: [] },
+    'redis',
+  );
+  assert.equal(positive.ambiguous, false, '正常主题命中照旧直接放行');
+  assert.equal(positive.ambiguousReason, '');
+
+  // 断句：否定在上一句，不影响下一句的整词命中。
+  const nextSentence = evidenceBindingOf(
+    { id: 'p2', text: '水泵没有异响。Redis 内存占用 2GB。', entities: [] },
+    'redis',
+  );
+  assert.equal(nextSentence.ambiguous, false, '否定词不在命中的那句里，不该误伤');
+
+  // 一句里多个候选实体词：候选集一起传时算歧义；不传候选集时行为与以前一致。
+  const record = { id: 'm1', text: 'alpha 和 beta 都在同一段正文里，分不清这条证据说的是谁', entities: [] };
+  const one = evidenceBindingOf(record, 'alpha');
+  assert.equal(one.ambiguous, false, '单看一个实体键（不传候选集）不判多候选');
+  const multi = evidenceBindingOf(record, 'alpha', { candidates: ['alpha', 'beta'] });
+  assert.equal(multi.ambiguous, true);
+  assert.match(multi.ambiguousReason, /multiple_entities_in_sentence/);
+
+  // selectEntityEvidence 把候选集透传下去：命中项带出来的 basis 也得是歧义。
+  const hit = selectEntityEvidence(
+    [{ ...record, type: 'world', status: 'active' }],
+    { entityKey: 'alpha', candidateNorms: ['alpha', 'beta'] },
+  ).items[0];
+  assert.equal(hit.basis.ambiguous, true);
+  assert.match(hit.basis.ambiguousReason, /multiple_entities_in_sentence/);
+});

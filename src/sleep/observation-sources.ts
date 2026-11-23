@@ -70,6 +70,18 @@ export interface SelectEntityEvidenceOptions {
   links?: Iterable<EvidenceLink>;
   /** 已算好的根表；给了就复用，不再自己算。 */
   rootsMap?: ReadonlyMap<string, SourceRoots>;
+  /**
+   * 本次观察的候选实体词（display/别名都行）：正文命中句里同时出现别的候选实体词时，
+   * 这条「提及」不唯一，交复核（2026-11-23 t-mwszo23a-iwxs）。不给就只按单个实体判，
+   * 与加这条之前的行为一致。
+   */
+  candidateNorms?: string[];
+}
+
+/** evidenceBindingOf 的可选项。 */
+export interface EvidenceBindingOptions {
+  /** 同一批候选实体词；只用于「一句里多个候选」这条歧义判据，不参与命中规则。 */
+  candidates?: Iterable<string>;
 }
 
 /** 绑定命中的规则：精确键 / 整词前缀 / 旧行正文整词。 */
@@ -113,6 +125,44 @@ export const BINDING_SNIPPET_PAD = 16;
 export const BINDING_MIN_LOCATE_CONTEXT = 4;
 /** 短于这个长度的整词命中太容易撞词：不直接放行，交复核。 */
 export const BINDING_REVIEW_WORD_LEN = 3;
+
+/**
+ * 句子级「顺带提及」判据（2026-11-23 t-mwszo23a-iwxs）。
+ *
+ * 整词 + 长度够只说明「正文里出现过这个词」，不说明这句话在讲它。命中所在句子带否定 /
+ * 排除 / 对比语气时（「本轮只修水泵，未检查 Redis。」），只是顺口带一句，不能当主题命中
+ * 直接放行——降级为待复核（ambiguous），既不直接拒也不直接放行。
+ *
+ * 只加严：这些规则只把 ambiguous 从 false 抬到 true，不改 exact / prefix 命中，也不放宽
+ * 任何长度/定位判据。
+ */
+export const MENTION_NEGATION_RE = /未(?!来|成年)|没(?:有|检查|查|测|改|修|动|碰|处理|涉及|确认|验证|看|核对|跟进|管|用|做)|不是|并非|而非|而不是|除了|除[^。！？；\n]{0,24}外|排除|不算/;
+/** 「只修 X」这类范围声明：本句在讲处理/修理的对象，别的词只是被拿来对照。 */
+export const MENTION_SCOPE_RE = /只(?:修|改|动|碰|处理|管|查|看|测|负责|涉及|覆盖|针对)/;
+/** 断句符：句号类 + 分号 + 换行。逗号不算句界（「只修水泵，未检查 Redis」还得在同一句里）。 */
+const SENTENCE_BREAK = /[。！？!?；;\n]/;
+
+/** 命中位置所在的整句（按 SENTENCE_BREAK 切）。 */
+function sentenceAt(text: string, at: number): string {
+  let from = Math.max(0, Math.min(at, text.length));
+  while (from > 0 && !SENTENCE_BREAK.test(text[from - 1])) from -= 1;
+  let to = Math.max(0, Math.min(at, text.length));
+  while (to < text.length && !SENTENCE_BREAK.test(text[to])) to += 1;
+  return text.slice(from, to);
+}
+
+/** 同一句里还出现了哪些别的候选实体词（整词、长度 ≥2）；空数组表示不歧义。 */
+function otherCandidatesIn(sentence: string, key: string, candidates: Iterable<string> | undefined): string[] {
+  if (!candidates) return [];
+  const hay = foldForMatch(sentence);
+  const out: string[] = [];
+  for (const raw of candidates) {
+    const norm = foldForMatch(String(raw ?? ''));
+    if (!norm || norm.length < 2 || norm === key || out.includes(norm)) continue;
+    if (firstWholeWordAt(hay, norm) >= 0) out.push(norm);
+  }
+  return out;
+}
 
 /** selectEntityEvidence 的返回：items 是截断后的，total 是截断前的命中数。 */
 export interface EntityEvidenceSelection {
@@ -407,14 +457,18 @@ function locateContextOf(text: string, at: number, len: number): number {
  * 2) 记录实体键以观察键为「完整词前缀」且正文里观察键作为独立词出现（观察键长度 ≥3）→ prefix；
  * 3) 老记录实体列为空：正文整词兜底 → text。
  *
- * text 规则额外算歧义标记：观察键只有 2 个字符、或片段之外没有足够正文可定位，
- * 都标 ambiguous（调用方排待复核，不直接拒也不直接放行）；正文里连整词都没出现
- * （例如 'read' 只出现在 'readonly' 里、或只是泛泛提及）则返回 null，照旧拒绝。
+ * text 规则额外算歧义标记（2026-11-23 t-mwszo23a-iwxs）：
+ *   - 观察键只有 2 个字符 / 片段之外没有足够正文可定位 → word_too_short / snippet_too_short；
+ *   - 命中所在句带否定、排除、对比或「只修 X」范围语气 → negated_mention / scope_limited_mention；
+ *   - 同一句里还有别的候选实体词 → multiple_entities_in_sentence。
+ * 歧义只排待复核（调用方），不直接拒也不直接放行；正文里连整词都没出现（例如 'read'
+ * 只出现在 'readonly' 里、或只是泛泛提及）则返回 null，照旧拒绝。
  *
  * 前缀规则只在「记录键是观察键的完整词前缀 + 正文同样有整词」时成立，
- * 单独的前缀相似（'tree' vs 'treehouse'）拿不到 basis。
+ * 单独的前缀相似（'tree' vs 'treehouse'）拿不到 basis；已带实体键的行以实体列为准，
+ * 不因为在否定句里提了一句就被降级。
  */
-export function evidenceBindingOf(record: MemoryRecord, norm: string): EvidenceBasis | null {
+export function evidenceBindingOf(record: MemoryRecord, norm: string, options: EvidenceBindingOptions = {}): EvidenceBasis | null {
   const key = String(norm ?? '').trim();
   if (!key) return null;
   const keys = entityKeysOf(entityList(record?.entities));
@@ -451,6 +505,11 @@ export function evidenceBindingOf(record: MemoryRecord, norm: string): EvidenceB
   const reasons: string[] = [];
   if (key.length < BINDING_REVIEW_WORD_LEN) reasons.push('word_too_short');
   if (locateContextOf(text, at, key.length) < BINDING_MIN_LOCATE_CONTEXT) reasons.push('snippet_too_short');
+  // 句中语气：顺带提及（否定/排除/对比/只修 X）不是主题命中，降级交复核。
+  const sentence = sentenceAt(text, at);
+  if (MENTION_NEGATION_RE.test(sentence)) reasons.push('negated_mention');
+  if (MENTION_SCOPE_RE.test(sentence)) reasons.push('scope_limited_mention');
+  if (otherCandidatesIn(sentence, key, options.candidates).length) reasons.push('multiple_entities_in_sentence');
   return {
     rule: 'text',
     entityNorm: key,
@@ -489,7 +548,7 @@ export function selectEntityEvidence(
 
   // 命中依据与命中项一起排：同一次 evidenceBindingOf 的结论既用来筛，也随 items 带回调用方
   const matched = list
-    .map((record) => ({ record, basis: evidenceBindingOf(record, entityNorm) }))
+    .map((record) => ({ record, basis: evidenceBindingOf(record, entityNorm, { candidates: options.candidateNorms }) }))
     .filter((item): item is { record: MemoryRecord; basis: EvidenceBasis } => {
       if (!item.basis) return false;
       const record = item.record;

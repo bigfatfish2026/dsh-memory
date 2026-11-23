@@ -213,8 +213,10 @@ function assertEvidence(
 
     // 旧行（实体列为空）：正文整词绑定，规则与 selectEntityEvidence 共用 evidenceBindingOf
     if (keys.length === 0) {
+      // 候选实体键一起传进去：同一句里出现多个候选实体词也算歧义（句子级判据在
+      // evidenceBindingOf 里，与取证据同一份；2026-11-23 t-mwszo23a-iwxs）。
       const bindings = candidateKeys
-        .map((key) => evidenceBindingOf(row, key))
+        .map((key) => evidenceBindingOf(row, key, { candidates: candidateKeys }))
         .filter((basis): basis is EvidenceBasis => Boolean(basis));
       if (bindings.length === 1 && !bindings[0].ambiguous) continue;
       if (bindings.length >= 1) {
