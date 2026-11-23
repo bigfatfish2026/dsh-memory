@@ -5,6 +5,7 @@
  * mergeBatchCache / stageLogged 归 SlotScheduler，env 上不留副本；子模块不许各持一份。
  */
 import { createBatchPlanner, cosine } from '../batch-planner.js';
+import { DEFAULT_ITEM_REVIEW_NEIGHBORS } from '../item-review-cache.js';
 import { runNotify } from '../shared/notify.js';
 import { batchMaxCos } from '../cluster.js';
 import { foldForMatch } from '../shared/entity-normalize.js';
@@ -98,6 +99,11 @@ export interface SleepCfg {
   organizeBatchPackSize?: unknown;
   organizeBatchPackMinSpanDays?: unknown;
   organizeBatchPackMaxSpanDays?: unknown;
+  /**
+   * 增量复审的旧邻居上限（2026-11-23，t-mwszo19h-pqlj）：schema 与默认值在 src/index.ts，
+   * 默认 DEFAULT_ITEM_REVIEW_NEIGHBORS = 8。全链只认这一处配置，别在调用点写死。
+   */
+  sleepItemReviewNeighbors?: unknown;
   clusterQuestionMin?: unknown;
   funnelCheapMin?: unknown;
   funnelVectorCeil?: unknown;
@@ -242,6 +248,16 @@ function centroidOf(vecs: Array<Float32Array | undefined>): Float32Array | null 
   return out;
 }
 
+/**
+ * 增量复审的旧邻居上限：全链唯一口径（2026-11-23，t-mwszo19h-pqlj）。
+ * 只认配置 sleepItemReviewNeighbors；没配/配坏就退 DEFAULT_ITEM_REVIEW_NEIGHBORS（8）。
+ * batch-planner / pool / replay / organize 都从这里取，别在调用点写死数字。
+ */
+export function itemReviewNeighborsOf(cfg: { sleepItemReviewNeighbors?: unknown } | null | undefined): number {
+  const n = Math.floor(Number(cfg?.sleepItemReviewNeighbors));
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_ITEM_REVIEW_NEIGHBORS;
+}
+
 export function createSleepEnv(ctx: SleepCtx, store: SleepStore, cfg: SleepCfg): SleepEnvCore {
   const stateStore = stateOf(cfg);
   // 轮级可变状态（inFlight / roundSnapshot / mergeBatchCache / stageLogged）不在这里：
@@ -293,6 +309,7 @@ export function createSleepEnv(ctx: SleepCtx, store: SleepStore, cfg: SleepCfg):
       packSize: Number(cfg.organizeBatchPackSize ?? 0),
       packMinSpanDays: Number(cfg.organizeBatchPackMinSpanDays ?? 1),
       packMaxSpanDays: Number(cfg.organizeBatchPackMaxSpanDays ?? 30),
+      itemNeighborLimit: itemReviewNeighborsOf(cfg),
       log: (line) => log(cfg, line),
     });
   }

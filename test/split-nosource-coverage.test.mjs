@@ -298,6 +298,6 @@ test('③ 分类计数与构造数据一致，且能和 pending_ops 的 done/dea
     + stats.versionMismatch + stats.coverageBlocked + stats.unavoidable + stats.inflateDead;
   assert.equal(sum, stats.scanned, '每条 op 恰好一类，相加等于 scanned');
   const logLine = logs.find((line) => line.includes('[split] 并发')) || '';
-  assert.match(logLine, /条 6 落库 2 全判重 1 跳过 1 回队 0（含不可拆 0） 版本不符 1 覆盖未过 1 判死 0 失败 2 分类合计 6/);
+  assert.match(logLine, /条 6 落库 2 全判重 1 跳过 1 回队 0（含不可拆 0） 版本不符 1 覆盖未过 1 判死 0 预检落死 0 失败 2 分类合计 6/);
   assert.doesNotMatch(logs.join('\n'), /分类合计 \d+ 与条 \d+ 不符/);
 });

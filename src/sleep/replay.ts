@@ -14,6 +14,7 @@ import type { DueOp } from '../ingest-index.js';
 import type { Row } from '../store/types.js';
 import type { SnapshotView, MemoryView } from '../store/types.js';
 import type { SleepCfg, SleepCtx, SleepStore } from './env.js';
+import { itemReviewNeighborsOf } from './env.js';
 import type { AgentOp, AgentClusterItem } from './agent-ops.js';
 import type { MergeOp } from './ledger-glue.js';
 
@@ -142,7 +143,10 @@ async function replayMergeBatchSegment(deps: ReplayDeps): Promise<void> {
           }
           return cheapSimilarity(a as never, b as never);
         };
-        const shrunk = shrinkClusterForReview(cluster as unknown as [], itemCache, { relate: relate as never });
+        const shrunk = shrinkClusterForReview(cluster as unknown as [], itemCache, {
+          relate: relate as never,
+          neighborLimit: itemReviewNeighborsOf(cfg),
+        });
         if (shrunk.cluster.length < 2) {
           finish('merge_batch', op, 'done', 'item_settled');
           continue;
@@ -207,12 +211,16 @@ async function replayMergeBatchSegment(deps: ReplayDeps): Promise<void> {
         });
         const acted = applied.merged.length + applied.updated.length + applied.archived.length +
           applied.added.length + applied.split.length;
-        // 条目级结论记进本轮累积表：段尾一次写回，下一轮同内容的条目不再重问
+        // 条目级结论记进本轮累积表：段尾一次写回，下一轮同内容的条目不再重问。
+        // 只记模型明确点到的 id；校验被拒/写入闸打回的一条不记（t6 复核 bug 3）。
         if (canPersistItems) {
           itemCacheRound = mergeItemReviewCache(
             itemCacheRound,
             reviewAdditionsFromOps(cluster as unknown as [], checked.valid, {
-              rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+              rejected: [
+                ...checked.invalid.map((x) => ({ ids: x.ids })),
+                ...applied.rejected as { ids?: unknown; id?: unknown }[],
+              ],
             }),
           );
           itemDirty = true;

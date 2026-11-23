@@ -68,6 +68,27 @@ test('内存版：接口一致，不碰文件', () => {
   assert.deepEqual(st.load().owedSlots, { a: 1 });
 });
 
+test('load：itemReviewCache 类型坏了只丢这个字段，别拖累 owner/slots（t-mwszo19h-pqlj）', () => {
+  const file = tmpFile();
+  fs.writeFileSync(file, JSON.stringify({
+    lastSleepAt: 42,
+    lastSleepDay: '2026-11-23',
+    owner: 'boot:1:2',
+    slots: { 'a b': 1 },
+    organizeCache: { k: { v: 'noop', t: 1 } },
+    itemReviewCache: ['坏的'],
+  }), 'utf8');
+  const st = createSleepState({ file });
+  const state = st.load();
+  assert.equal(state.lastSleepAt, 42, '别的字段照读');
+  assert.equal(state.owner, 'boot:1:2');
+  assert.deepEqual(state.slots, { 'a b': 1 });
+  assert.equal('itemReviewCache' in state, false, '只丢这一个字段');
+  // 别的好字段坏了仍然整份回空态（口径不放宽）
+  fs.writeFileSync(file, JSON.stringify({ lastSleepAt: 42, owner: 'x', slots: ['坏'] }), 'utf8');
+  assert.deepEqual(createSleepState({ file }).load(), { lastSleepAt: 0, lastSleepDay: '' });
+});
+
 test('边界：没给 file 直接抛；update 返回 null 时保留原 state', () => {
   assert.throws(() => createSleepState({}), /file 必填/);
   const file = tmpFile();

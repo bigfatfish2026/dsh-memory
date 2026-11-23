@@ -285,7 +285,8 @@ async function organizePassAgent({ dryRun = false } = {}) {
       out.noop += 1;
       if (!dryRun) {
         cache[fp] = { v: 'noop', t: Date.now() };
-        // 条目级也记：这批每条都「看过、不用动」，下一轮同内容不再重送。
+        // 条目级也记：模型明确给空 ops = 整批「看过、不用动」，记 noop + 同批组键；
+        // 这是唯一允许整批记 noop 的情形（t6 复核 bug 3）。
         itemNext = mergeItemReviewCache(itemNext, reviewAdditionsFromOps(cluster, []));
       }
       log(cfg, `[merge] 第${out.calls}批明确空 ops（${cluster.length}条 fp=${fp}）：记 noop 缓存，不入队`);
@@ -324,11 +325,14 @@ async function organizePassAgent({ dryRun = false } = {}) {
     out.added.push(...applied.added);
     out.rejected.push(...applied.rejected);
     out.split.push(...applied.split);
-    // 条目级结论：模型看过的每一条都记（acted 或「看过不用动」= noop）；
-    // 被写入闸/证据校验打回的 id 不记，下一轮同内容还要再问一遍。
+    // 条目级结论：只记模型明确点到的 id（单 id update/archive 记 acted、不记 noop）；
+    // 校验被拒/写入闸打回/模型没提到的一条不记，下一轮同内容还要再问一遍（t6 复核 bug 3）。
     if (!dryRun) {
       itemNext = mergeItemReviewCache(itemNext, reviewAdditionsFromOps(cluster, checked.valid, {
-        rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+        rejected: [
+          ...checked.invalid.map((x) => ({ ids: x.ids })),
+          ...applied.rejected as { ids?: unknown; id?: unknown }[],
+        ],
       }));
     }
     const acted = applied.merged.length + applied.updated.length + applied.archived.length +

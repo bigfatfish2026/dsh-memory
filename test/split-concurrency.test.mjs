@@ -178,7 +178,7 @@ test('20 条 + 并发 4：全部处理、写库峰值 1、顺序无关结果一�
   assert.match(first.logs.join('\n'), /\[split\] item=m_\d+ parts=2 retry=0 rejected=0 inserted=2 deduped=0 replayed=0 ms=\d+/);
   // 2026-11-20 汇总口径：只数真正落库的，其余分类单列（以前写「成功 = scanned - failed」，
   // 把 skipped/versionMismatch/no_source_id 都算成成功）
-  assert.match(first.logs.join('\n'), /\[split\] 并发 4 路 条 20 落库 20 全判重 0 跳过 0 回队 0（含不可拆 0） 版本不符 0 覆盖未过 0 判死 0 失败 0 分类合计 20/);
+  assert.match(first.logs.join('\n'), /\[split\] 并发 4 路 条 20 落库 20 全判重 0 跳过 0 回队 0（含不可拆 0） 版本不符 0 覆盖未过 0 判死 0 预检落死 0 失败 0 分类合计 20/);
 });
 
 test('单条失败：其他照常、只 attempts+1、同轮不原地重试', async () => {
@@ -204,7 +204,7 @@ test('单条失败：其他照常、只 attempts+1、同轮不原地重试', asy
   assert.equal(bad.attempts, 1, '同轮不许原地重试，attempts 只能 +1');
   assert.equal(ops.filter((r) => r.status === 'done').length, 19);
   assert.equal(store.report().peak, 1);
-  assert.match(logs.join('\n'), /\[split\] 并发 4 路 条 20 落库 19 全判重 0 跳过 0 回队 1（含不可拆 0） 版本不符 0 覆盖未过 0 判死 0 失败 1 分类合计 20/);
+  assert.match(logs.join('\n'), /\[split\] 并发 4 路 条 20 落库 19 全判重 0 跳过 0 回队 1（含不可拆 0） 版本不符 0 覆盖未过 0 判死 0 预检落死 0 失败 1 分类合计 20/);
 });
 
 test('自适应关闭 → 用固定值；固定值就是实际路数', async () => {

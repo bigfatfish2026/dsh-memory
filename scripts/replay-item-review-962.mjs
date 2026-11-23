@@ -24,7 +24,8 @@ import { DEFAULT_DB_PATH } from './lib/db.mjs';
 import { merge as askMergeOps } from '../lib/agents/merge.js';
 import { createRehearseLlm } from './rehearse-pipeline.mjs';
 import {
-  shrinkClusterForReview, reviewAdditionsFromOps, itemReviewKey,
+  shrinkClusterForReview, reviewAdditionsFromOps, itemReviewKey, itemReviewGroupKey,
+  DEFAULT_ITEM_REVIEW_NEIGHBORS,
 } from '../lib/item-review-cache.js';
 
 const args = process.argv.slice(2);
@@ -38,7 +39,17 @@ const JSON_OUT = args.includes('--json');
 const BASE_URL = arg('--base-url', process.env.DSH_REHEARSE_BASE_URL || 'http://127.0.0.1:3425/v1');
 const MODEL = arg('--model', process.env.DSH_REHEARSE_MODEL || 'group/ds');
 const TARGET_ID = arg('--target-id', '');
-const NEIGHBORS = Math.max(0, Math.floor(Number(arg('--neighbors', '2')) || 2));
+/**
+ * 每个变化项带几个旧邻居。默认值只认生产同一个常量 DEFAULT_ITEM_REVIEW_NEIGHBORS
+ * （= 配置 sleepItemReviewNeighbors 的默认值，8）；别在这里另写死一个数字（t6 复核 bug 2）。
+ * --neighbors N 可显式覆盖，用来对照 2 / 8 两档的送审量。
+ */
+const NEIGHBORS = (() => {
+  const raw = arg('--neighbors', '');
+  if (raw === '') return DEFAULT_ITEM_REVIEW_NEIGHBORS;
+  const n = Math.floor(Number(raw));
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_ITEM_REVIEW_NEIGHBORS;
+})();
 /** 每个口径重复跑几次（只在 --ask 下生效）。模型非确定：单跑一次归因不了差异，要拿重复臂量噪声。 */
 const REPEAT = Math.max(1, Math.floor(Number(arg('--repeat', '1')) || 1));
 
@@ -186,10 +197,16 @@ async function main() {
       : { same: [], rewritten: target.ids };
     const oldMembers = loadMembers(db, target.ids, target.items);
     const sameSet = new Set(same);
-    // 离线口径：把「逐字相同」的成员当作早上已审过（缓存值为 noop；--ask 时用真实结论覆盖）
+    // 离线口径：把「逐字相同」的成员当作早上那批一起审过（noop + 同批组键 g）。
+    // 关系级证据只认「同一批一起给过结论」（t6 复核 bug 1）：各自在不同批判过无关，
+    // 不能证明它们这一对判过，所以离线缓存必须带上 morning 那批的组键。
     let itemCache = {};
+    const morningMembersOffline = oldMembers.filter((m) => sameSet.has(String(m.id)));
+    const morningGroup = morningMembersOffline.length >= 2 ? itemReviewGroupKey(morningMembersOffline) : '';
     for (const m of oldMembers) {
-      if (sameSet.has(String(m.id))) itemCache[itemReviewKey(m)] = { v: 'noop', t: 0 };
+      if (sameSet.has(String(m.id))) {
+        itemCache[itemReviewKey(m)] = morningGroup ? { v: 'noop', t: 0, g: morningGroup } : { v: 'noop', t: 0 };
+      }
     }
 
     const oldRuns = [];
@@ -266,6 +283,7 @@ async function main() {
       newSent: shrunk.cluster.length,
       reused: shrunk.skipped.length,
       neighbors: shrunk.neighbors.length,
+      neighborsLimit: NEIGHBORS,
       oldOps: oldSigs.size,
       newOps: newSigs.size,
       cachedOps: cachedOps.size,
@@ -311,7 +329,7 @@ async function main() {
     console.log('口径            送审条数   复用已审   输入token   输出token   结论op数');
     console.log(`旧（整批）        ${String(report.oldSent).padEnd(10)} ${String(0).padEnd(10)} ${String(inTokens).padEnd(11)} ${String(outTokens).padEnd(11)} ${ASK ? oldSigs.size : '-'}`);
     console.log(`新（增量复审）    ${String(report.newSent).padEnd(10)} ${String(report.reused).padEnd(10)} ${String(estIn).padEnd(11)} ${String(estOut).padEnd(11)} ${ASK ? newSigs.size : '-'}`);
-    console.log(`  其中邻居        ${report.neighbors} 条；逐字未变 ${report.same} 条、改写 ${report.rewritten} 条`);
+    console.log(`  其中邻居        ${report.neighbors} 条（每个变化项上限 ${NEIGHBORS}：DEFAULT_ITEM_REVIEW_NEIGHBORS / sleepItemReviewNeighbors）；逐字未变 ${report.same} 条、改写 ${report.rewritten} 条`);
     console.log('');
     if (!ASK) {
       console.log('结论差异：未跑模型（加 --ask 才做真模型对照）');

@@ -56,11 +56,19 @@ README 讲功能，这文件讲「动手改的时候照哪里做」。
 
 - 键 = 条目 id + 正文原始字节 sha1（`itemReviewKey`）。**正文变了才失效**；
   成员数组变化不碰键，老条目继续命中。别把 type/entities/ts 拼进键——那些不决定合并结论。
-- 送审内容 = 变化项（新增/改写）+ 它们最相关的旧邻居（默认 8 条，`DEFAULT_ITEM_REVIEW_NEIGHBORS`；
-  962 那笔实测：89 个变化项带出 8 条不同旧邻居，送审 962→97）。全批都已审过 → 一条不送；全批首见 → 整批原样送。
+- **判定粒度是「一对」，不是「一条」**（2026-11-23，t-mwszo19h-pqlj 修 t6 复核 bug 1）：
+  A、B 各自在别的批里判过，不等于 A 与 B 的关系判过。关系已审的证据只有两种：
+  `rel` 里记着对方的条目键（同一 op 里同时点到），或两条的 `g`（同批组键）相同（同一批显式给过结论）。
+  `shrinkClusterForReview` 全批命中时逐对检查，缺哪条关系就送哪两条；部分变化时只给变化项配 top-N 未审对手。
+- 送审内容 = 变化项（新增/改写）+ 它们最相关的旧邻居。邻居上限只认配置
+  `sleepItemReviewNeighbors`（默认 8，`DEFAULT_ITEM_REVIEW_NEIGHBORS`），
+  batch-planner / pool / replay / 回放脚本都读同一个值，不许再写死 2。
+  962 那笔离线回放（relate 为空，按批内顺序取邻居）：送审 962→97（复用 865），
+  按 2 邻居是 91（复用 871）；生产带向量 relate 时每个变化项带不同邻居，送审量在两者之上。
 - 缓存落在 `sleep.state.json` 顶层 `itemReviewCache`（跟 `organizeCache` / `splitVerdictCache`
   一套 `stateStore` 机制），轮转复用 `trimOrganizeCache`（按 t 留最近 2000 条）。
-- 只记有效结论：acted 或明确 noop；被证据校验/写入闸打回的 id 不记，下一轮还得重问。
+- 只记真正判过的：同一 op 里点到 → acted（带 rel）；整批显式空 ops → noop + 同批组键；
+  校验被拒、单 id update/archive 没有对手、模型没提到、空响应/解析失败 → 一条都不记，下一轮重问。
 - 日志固定两行，排查先 grep 它们：
   - planner：`[merge] 增量复审 条目 <N>→<M>（已审过 <K> 条不再重送；收缩批 <a>、整批已审过 <b>）`
   - pool 收尾：`[item-review] 条目缓存 本轮新增 <n> 条，主文件留 <m> 条`

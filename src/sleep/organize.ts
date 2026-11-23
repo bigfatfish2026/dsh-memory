@@ -238,8 +238,9 @@ async function organizePass({ dryRun = false }: { dryRun?: boolean } = {}): Prom
       out.rejected.push(...r.rejected);
       const acted = r.merged.length + r.updated.length + r.archived.length > 0;
       cache[fp as string] = { v: acted ? 'acted' : 'noop', t: Date.now() };
-      // 条目级结论：模型看过的每一条都记（acted 或「看过不用动」= noop）；
-      // 被 applyActions 打回的 id 一条都不记，下一轮还得重问。
+      // 条目级结论：只记模型明确点到的 id（单 id update/archive 记 acted、不记 noop）；
+      // 三个桶都空 = 模型明确「这批不动」，按整批 noop + 同批组键记。
+      // 被 applyActions 打回的 id 一条都不记，下一轮还得重问（t6 复核 bug 3）。
       if (!dryRun) {
         itemNext = mergeItemReviewCache(itemNext, reviewAdditionsFromActions(cluster, actions as never, { rejected: r.rejected as never[] }));
       }

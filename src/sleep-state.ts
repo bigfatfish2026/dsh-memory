@@ -65,8 +65,15 @@ function asSleepState(raw: unknown): SleepState | null {
     || (v !== null && typeof v === 'object' && !Array.isArray(v));
   if (!numOrMissing(s.lastSleepAt) || !strOrMissing(s.lastSleepDay)) return null;
   if (!strOrMissing(s.owner) || !numOrMissing(s.runningAt) || !numOrMissing(s.heartbeatAt)) return null;
-  for (const key of ['slots', 'owedSlots', 'organizeCache', 'splitVerdictCache', 'itemReviewCache']) {
+  for (const key of ['slots', 'owedSlots', 'organizeCache', 'splitVerdictCache']) {
     if (!objOrMissing(s[key])) return null;
+  }
+  // itemReviewCache 是纯增量复审缓存（2026-11-23，t-mwszo19h-pqlj）：它坏了只丢这一个字段，
+  // 别让整份 state 回空态——owner / slots / organizeCache 都不能被一块坏缓存连坐。
+  if (!objOrMissing(s.itemReviewCache)) {
+    const rest: Record<string, unknown> = { ...s };
+    delete rest.itemReviewCache;
+    return rest as SleepState;
   }
   return s as SleepState;
 }

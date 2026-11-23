@@ -27,6 +27,7 @@ import { setupEntityQueue } from './entity-worker.js';
 import { entityGraphOf } from './entity-graph.js';
 import { assertMayWrite } from './write-guard.js';
 import { llmOf } from './llm-service.js';
+import { DEFAULT_ITEM_REVIEW_NEIGHBORS } from './item-review-cache.js';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { MemoryStore } from './store/memory-store.js';
 import type { StoreConfig } from './store/types.js';
@@ -540,6 +541,13 @@ export const Config: Schema<MemoryConfig> = Schema.object({
   organizeBatchPackMinSpanDays: Schema.number().step(1).min(0).default(1),
   /** 合批上限：跨度超过这个天数不拼（默认 30；2-30 天实测 96.4%）。 */
   organizeBatchPackMaxSpanDays: Schema.number().step(1).min(1).default(30),
+  /**
+   * 增量复审（2026-11-23，t-mwszo19h-pqlj）：每个变化项最多带几个旧邻居一起送审。
+   * 默认 DEFAULT_ITEM_REVIEW_NEIGHBORS = 8。生产口径只认这一处：
+   * batch-planner / pool / replay / scripts/replay-item-review-962.mjs 都读同一个值，
+   * 不许再各自写死 2。0 = 只送变化项（不省钱的档）。
+   */
+  sleepItemReviewNeighbors: Schema.number().step(1).min(0).default(DEFAULT_ITEM_REVIEW_NEIGHBORS),
   /**
    * 全链并发的「手工上限覆盖」：0 = 不覆盖，走 organizeIngestConcurrency + 负载自适应。
    * 2026-11-14 收敛：它以前只被 merge 段当独立并发数用（还额外写死硬顶 8），现在只许往下压，

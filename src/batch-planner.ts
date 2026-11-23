@@ -20,7 +20,7 @@
  * 每一级都由 organizeFunnelMode 控制：off（默认）/ l0 / l1 / l2（'on' 等同 l2）。
  * off 时 plan() 的产物与改造前逐条一致（回归锁见 test/batch-planner.test.mjs）。
  */
-import { shrinkClusterForReview } from './item-review-cache.js';
+import { DEFAULT_ITEM_REVIEW_NEIGHBORS, shrinkClusterForReview } from './item-review-cache.js';
 import type { ItemReviewCache, ReviewItem } from './item-review-cache.js';
 /** 批次里的一条记忆：候选自带 id/text/vector，其余字段按来源可能有。 */
 export interface MemoryClusterItem {
@@ -115,7 +115,10 @@ export interface BatchPlannerSpec {
   packSize?: number;
   packMinSpanDays?: number;
   packMaxSpanDays?: number;
-  /** 增量复审：每个变化项最多带几个旧邻居一起送（默认 2；0 = 只送变化项）。 */
+  /**
+   * 增量复审：每个变化项最多带几个旧邻居一起送（默认 DEFAULT_ITEM_REVIEW_NEIGHBORS=8；
+   * 0 = 只送变化项）。生产值由 sleepItemReviewNeighbors 配置传入，别在这里写死数字。
+   */
   itemNeighborLimit?: number;
   log?: (line: string) => void;
 }
@@ -380,7 +383,7 @@ export function createBatchPlanner({
   packSize = 0,
   packMinSpanDays = 1,
   packMaxSpanDays = 30,
-  itemNeighborLimit = 2,
+  itemNeighborLimit = DEFAULT_ITEM_REVIEW_NEIGHBORS,
   log = () => {},
 }: Partial<BatchPlannerSpec> = {}): BatchPlanner {
   if (typeof clusterOf !== 'function' || typeof splitBatches !== 'function' || typeof fingerprint !== 'function') {

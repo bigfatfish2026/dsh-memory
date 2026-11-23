@@ -13,7 +13,7 @@ import { dayKey } from './slots.js';
 import { CLUSTER_PROMPT_SHELL_TOKENS } from './batching.js';
 import { cheapSimilarity, cosine } from '../batch-planner.js';
 import {
-  readItemReviewCache, itemReviewHit, shrinkClusterForReview, reviewAdditionsFromOps,
+  readItemReviewCache, pairReviewed, shrinkClusterForReview, reviewAdditionsFromOps,
 } from '../item-review-cache.js';
 import type { ReviewItem, ItemReviewCache } from '../item-review-cache.js';
 import type { DatabaseSync } from 'node:sqlite';
@@ -22,6 +22,7 @@ import type { MemoryRecord, MemoryView, SnapshotView, Row } from '../store/types
 import type { BatchPlanner } from '../batch-planner.js';
 import type { PromptBudget } from '../token-window.js';
 import type { SleepCfg, SleepCtx, SleepStore } from './env.js';
+import { itemReviewNeighborsOf } from './env.js';
 import type { SleepStateStore } from '../sleep-state.js';
 import type { AgentOp, AgentClusterItem } from './agent-ops.js';
 import type { ChannelPoolOptions, WriteLock, RunListPoolOptions, PoolResult } from '../pool.js';
@@ -385,15 +386,19 @@ async function prepareMergeBatchOp(op: DueOp): Promise<MergeBox> {
   if (groupIds) {
     const resolved = groupIds.map((g) => g.map((id) => byId.get(id)).filter(Boolean) as unknown as MemoryView[]);
     if (resolved.every((g) => g.length === 2)) {
-      // 组内一条变化都没有 = 这一组两两已审过，整组不送
-      const kept = resolved.filter((g) => g.some((m) => !itemReviewHit(itemCache, m as unknown as ReviewItem)));
+      // 组内这一对的关系审过才整组不送：两条各自在别的批里判过 ≠ 它们之间的对判过
+      // （t6 复核 bug 1，2026-11-23）。没审过的组留下，两条一起送。
+      const kept = resolved.filter((g) => !pairReviewed(itemCache, g[0] as unknown as ReviewItem, g[1] as unknown as ReviewItem));
       if (!kept.length) return { skip: 'item_settled', batchLabel };
       groups = kept;
       cluster = [...new Map(kept.flat().map((m) => [String(m.id), m])).values()];
     }
   }
   if (!groups) {
-    const shrunk = shrinkClusterForReview(cluster as unknown as ReviewItem[], itemCache, { relate });
+    const shrunk = shrinkClusterForReview(cluster as unknown as ReviewItem[], itemCache, {
+      relate,
+      neighborLimit: itemReviewNeighborsOf(cfg),
+    });
     if (shrunk.cluster.length < 2) return { skip: 'item_settled', batchLabel };
     cluster = shrunk.cluster as unknown as MemoryView[];
   }
@@ -453,9 +458,12 @@ async function commitPackedMerge(op: DueOp, box: MergeBox, ops: unknown[]): Prom
         for (const k of Object.keys(merged)) if (Array.isArray(applied[k as keyof typeof applied])) merged[k].push(...applied[k as keyof typeof applied]);
         done = applied.merged.length + applied.updated.length + applied.archived.length
           + applied.added.length + applied.split.length;
-        // 条目级结论：组内看过的每条都记；被打回的 id 不记（还得重问）
+        // 条目级结论：只有真的进过校验、模型明确点到的 id 才记；校验被拒/写入闸打回的一条不记
         env.scheduler.putItemReview?.(reviewAdditionsFromOps(groups[i] as unknown as ReviewItem[], checked.valid, {
-          rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+          rejected: [
+            ...checked.invalid.map((x) => ({ ids: x.ids })),
+            ...applied.rejected as { ids?: unknown; id?: unknown }[],
+          ],
         }));
         acted += done;
       }
@@ -506,9 +514,9 @@ async function commitMergeBatchOp(op: DueOp, box: MergeBox | null | undefined): 
   }
   const ops = Array.isArray(answer.ops) ? answer.ops : [];
   if (!ops.length) {
-    // 模型明确空 ops = 有效 noop：记缓存、终态 done，不耗 attempts
+    // 模型明确空 ops = 有效 noop：记缓存、终态 done，不耗 attempts。
+    // 条目级也记成「整批显式无关」（noop + 同批组键），这是唯一允许整批记 noop 的情形。
     env.scheduler.putMergeResult(batchLabel, { v: 'noop', t: Date.now() });
-    // 条目级也记：这批每条都「看过、不用动」，下一轮同内容不再重送
     env.scheduler.putItemReview?.(reviewAdditionsFromOps(box.cluster as unknown as ReviewItem[], []));
     markOp(store.db(), op.id, 'done', 'noop', { log: (line: string) => log(cfg, line) });
     return { noop: true };
@@ -532,9 +540,12 @@ async function commitMergeBatchOp(op: DueOp, box: MergeBox | null | undefined): 
   const acted = applied.merged.length + applied.updated.length + applied.archived.length
     + applied.added.length + applied.split.length;
   env.scheduler.putMergeResult(batchLabel, { v: acted ? 'acted' : 'noop', t: Date.now() });
-  // 条目级结论：看过的每条都记；被打回/被写入闸挡下的 id 不记
+  // 条目级结论：只有模型明确点到的 id 才记；校验被拒/被写入闸挡下/没提到的一条不记
   env.scheduler.putItemReview?.(reviewAdditionsFromOps(box.cluster as unknown as ReviewItem[], checked.valid, {
-    rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+    rejected: [
+      ...checked.invalid.map((x) => ({ ids: x.ids })),
+      ...applied.rejected as { ids?: unknown; id?: unknown }[],
+    ],
   }));
   markOp(store.db(), op.id, acted ? 'done' : 'pending', acted ? null : 'noop', { log: (line: string) => log(cfg, line) });
   return { acted, applied };
