@@ -21,7 +21,8 @@
  *     落 pending_ops）仍由主循环按序一条条做，写库永远只有一条线；
  *   - 并发数由调用方传：sleep.js 用 selectIngestConcurrency（与 ingest 同一个
  *     organizeIngestAdaptive 开关和负载算法，cap 64）算一次，一轮内固定不抖；
- *   - 单条失败只影响它自己：split() 自己 attempts+1，到 MAX_ATTEMPTS=5 转 dead，账不丢；
+ *   - 单条失败只影响它自己：真问过模型才 attempts+1，到 MAX_ATTEMPTS=5 转 dead，账不丢；
+ *     本地预检/判定缓存这类确定性跳过不计 attempts（countAttempt:false），永远不因此判死；
  *     本轮失败过的 id 不再在同一轮里被重新领到（next_try_at=now 会让它们立刻又到期）。
  */
 import type { DatabaseSync } from 'node:sqlite';
@@ -181,6 +182,11 @@ export interface SplitStats {
   cacheHits: number;
   /** 本地预检判「正文没有合法切点」而没问模型的条数（2026-11-23，t-mwsviczp-epd3）。 */
   precheckSkipped: number;
+  /**
+   * 预检/判定缓存跳过时 op 已经不在 pending 的条数（表写失败、行被判 dead 这类异常）。
+   * 正常恒为 0；单列出来是为了「按实际 status 记账」时分类合计仍等于 scanned。
+   */
+  precheckDead: number;
   /** 自动观察被挡在普通拆分外的条数（入口已挡，这里兜旧队列里已经入队的）。 */
   autoObservationSkipped: number;
 }
@@ -188,8 +194,10 @@ export interface SplitStats {
 /**
  * 一轮的分类口径（2026-11-20）：每条领到的 op 恰好落进一类，加起来等于 scanned。
  *   done：succeeded + dedupedOnly + skipped
- *   dead：versionMismatch + coverageBlocked + inflateDead
+ *   dead：versionMismatch + coverageBlocked + inflateDead + precheckDead
  *   pending：pendingAfter（unavoidable 也在这里）
+ * 预检/判定缓存跳过不递增 attempts（2026-11-23 t-mwszo23a-iwxs），按 recordSplitFailure
+ * 返回行的实际 status 落类：pending 进 pendingAfter，dead 进 precheckDead，done 进 skipped。
  * 以前汇总写 `成功 = scanned - failed`，把 skipped/versionMismatch/no_source_id 全算成成功，
  * 日志「条 245 成功 234 失败 11」而库里实际 done 102 / dead 95 / pending 41 就是这个原因。
  */
@@ -202,6 +210,7 @@ export interface SplitStatsBreakdown {
   coverageBlocked: number;
   unavoidable: number;
   inflateDead: number;
+  precheckDead: number;
 }
 
 /**
@@ -494,6 +503,7 @@ export function splitBreakdownOf(stats: SplitStats): SplitStatsBreakdown {
     coverageBlocked: Number(stats.coverageBlocked) || 0,
     unavoidable: Number(stats.unavoidable) || 0,
     inflateDead: Number(stats.inflateDead) || 0,
+    precheckDead: Number(stats.precheckDead) || 0,
   };
 }
 
@@ -503,8 +513,11 @@ export function splitBreakdownOf(stats: SplitStats): SplitStatsBreakdown {
  * 口径：不可拆包含在回队里，不单列。
  */
 export function splitClassificationSum(b: SplitStatsBreakdown): number {
-  return b.succeeded + b.dedupedOnly + b.skipped + b.pendingAfter
-    + b.versionMismatch + b.coverageBlocked + b.inflateDead;
+  // 逐项 Number(...)||0：老调用方/老夹具可能还没有 precheckDead，缺字段按 0 算，不许出 NaN。
+  return [
+    b.succeeded, b.dedupedOnly, b.skipped, b.pendingAfter,
+    b.versionMismatch, b.coverageBlocked, b.inflateDead, b.precheckDead,
+  ].reduce((sum, n) => sum + (Number(n) || 0), 0);
 }
 
 /** 多轮统计相加（轮末补扫用）：concurrency 取较大值，其余按条累加。 */
@@ -530,6 +543,7 @@ function mergeSplitStats(into: SplitStats, from: SplitStats): SplitStats {
   into.inflateDead += from.inflateDead;
   into.cacheHits += from.cacheHits;
   into.precheckSkipped += from.precheckSkipped;
+  into.precheckDead += from.precheckDead;
   into.autoObservationSkipped += from.autoObservationSkipped;
   into.concurrency = Math.max(into.concurrency, from.concurrency);
   return into;
@@ -619,6 +633,33 @@ function retryIfRunning(db: DatabaseSync, opId: string | number, reason: string,
 }
 
 /**
+ * 没调模型的确定性跳过（本地预检 / 判定缓存命中）按 recordSplitFailure 返回行的实际 status 记账
+ * （2026-11-23 t-mwszo23a-iwxs）。
+ *
+ * 不递增 attempts 之后正常只会是 pending；row 为 null（没表/写失败）或行已经被别的路径判 dead
+ * 时也不许先加 pendingAfter 再改——按实际状态落一类，分类合计仍等于 scanned。
+ */
+function countSkippedByActualStatus(
+  stats: SplitStats,
+  row: Row | null,
+  { sourceId, log }: { sourceId: string; log?: ((line: string) => void) | null },
+): void {
+  const status = String(row?.status || '');
+  if (status === 'pending') {
+    stats.pendingAfter += 1;
+    return;
+  }
+  if (status === 'done' || status === 'skipped') {
+    stats.skipped += 1;
+    return;
+  }
+  // dead / running / 没落成行：这一条已经不在 pending 队列里正常等下一轮，记死账留给人看。
+  stats.failed += 1;
+  stats.precheckDead += 1;
+  log?.(`[split] WARN 预检跳过没落成 pending item=${sourceId} status=${status || 'missing'}，计入 precheckDead`);
+}
+
+/**
  * 消费一批 split_item。领活按小批（= 并发数）走，一批收口完再领下一批；
  * 处理完按结果标 done / pending（split() 或写入闸自己会加 attempts）。
  *
@@ -659,7 +700,7 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
     inserted: 0, deduped: 0, parts: 0, rejected: 0, failed: 0, skipped: 0,
     charsBefore: 0, charsAfter: 0, concurrency: 0, versionMismatch: 0, coverageBlocked: 0,
     succeeded: 0, dedupedOnly: 0, pendingAfter: 0, inflateDead: 0,
-    cacheHits: 0, precheckSkipped: 0, autoObservationSkipped: 0,
+    cacheHits: 0, precheckSkipped: 0, precheckDead: 0, autoObservationSkipped: 0,
   };
   if (!db || !store) return stats;
   // memory_link 表在不在：一轮判一次（每条都判会刷屏）。缺表只提醒一次，边跳过、拆分照常落库。
@@ -801,43 +842,53 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
       // 且不在引号、括号、代码围栏内部）时，模型怎么问只会答 unavoidable——直接保留原文、
       // 落 pending 等下一轮，不打这次模型调用。判据与 split() 共用 legalCutPoints，
       // 有切点（哪怕边界模糊）一律照常送审，不在这里替模型做决定。
+      //
+      // 确定性跳过不耗 attempts（2026-11-23 t-mwszo23a-iwxs）：同一份正文下一轮还是无切点，
+      // 按旧口径攒 5 轮就 dead。走 countAttempt:false（markOp increment:false），落 pending
+      // 但账不推；账按返回行的实际 status 落类，不先加 pendingAfter。
       if (!hasLegalCutPoint(text)) {
         stats.unavoidable += 1;
-        stats.pendingAfter += 1;
         stats.precheckSkipped += 1;
         failedThisRound.push(op.id);
-        recordSplitFailure(db, {
+        const after = recordSplitFailure(db, {
           sourceId,
           text,
           type: splitTypeOf(store, payload, source),
           reason: 'precheck_unavoidable: 正文中没有合法切点',
           attempt: Number(op.attempts) || 0,
+          countAttempt: false,
           log,
           now: nowOf(),
         });
-        log?.(`[split] 预检不可拆 跳过模型 item=${sourceId} len=${text.length}`);
+        countSkippedByActualStatus(stats, after, { sourceId, log });
+        log?.(`[split] 预检不可拆 跳过模型 item=${sourceId} len=${text.length} attempts=${after?.attempts ?? '?'}`);
         continue;
       }
 
       // 「不可拆」判定缓存（2026-11-22）：同一正文 + 同一字数上限 + 同一规则版本不重复问模型。
-      // 命中仍按不可拆处理：recordSplitFailure 照旧落 pending、attempts+1，原文一个字不动；
+      // 命中仍按不可拆处理：recordSplitFailure 照旧落 pending、原文一个字不动；
       // 不影响 failedThisRound 的同轮去重，也不进 stats.tried（确实没调模型）。
+      //
+      // 与预检同一口径（2026-11-23 t-mwszo23a-iwxs）：命中缓存也是确定性跳过、没问模型，
+      // countAttempt:false → attempts 不动，不会因为同一份正文每轮命中缓存被判 dead。
+      // 正文变了键就变，自然重问；真实问模型后的失败仍照旧计 attempts。
       const cached = verdictCache ? verdictCache.hit(text, maxChars) : null;
       if (cached) {
         stats.unavoidable += 1;
-        stats.pendingAfter += 1;
         stats.cacheHits += 1;
         failedThisRound.push(op.id);
-        recordSplitFailure(db, {
+        const after = recordSplitFailure(db, {
           sourceId,
           text,
           type: splitTypeOf(store, payload, source),
           reason: `unavoidable: cached: ${cached.reason || 'unavoidable'}`,
           attempt: Number(op.attempts) || 0,
+          countAttempt: false,
           log,
           now: nowOf(),
         });
-        log?.(`[split] item=${sourceId} unavoidable 命中判定缓存，未调模型 ms=0`);
+        countSkippedByActualStatus(stats, after, { sourceId, log });
+        log?.(`[split] item=${sourceId} unavoidable 命中判定缓存，未调模型 ms=0 attempts=${after?.attempts ?? '?'}`);
         continue;
       }
 
@@ -1185,15 +1236,16 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
   // 现在只数真正落库的条数，其余分类单列，相加等于 scanned，能直接和 pending_ops 的
   // done/dead/pending 对上：
   //   done = succeeded + dedupedOnly + skipped
-  //   dead = versionMismatch + coverageBlocked + inflateDead
+  //   dead = versionMismatch + coverageBlocked + inflateDead + precheckDead
   //   pending = pendingAfter（不可拆已经算在里面，2026-11-22 起不再单列）
+  // precheckDead 正常是 0：预检/缓存跳过不计 attempts，落账就是 pending（2026-11-23）。
   if (stats.scanned > 0) {
     const b = splitBreakdownOf(stats);
     const sum = splitClassificationSum(b);
     log?.(
       `[split] 并发 ${peakConc || Math.min(conc, stats.scanned)} 路 条 ${stats.scanned} ` +
         `落库 ${b.succeeded} 全判重 ${b.dedupedOnly} 跳过 ${b.skipped} 回队 ${b.pendingAfter}（含不可拆 ${b.unavoidable}） ` +
-        `版本不符 ${b.versionMismatch} 覆盖未过 ${b.coverageBlocked} 判死 ${b.inflateDead} ` +
+        `版本不符 ${b.versionMismatch} 覆盖未过 ${b.coverageBlocked} 判死 ${b.inflateDead} 预检落死 ${b.precheckDead} ` +
         `失败 ${stats.failed} 分类合计 ${sum} 缓存命中 ${stats.cacheHits} ` +
         `预检跳过 ${stats.precheckSkipped} 自动观察跳过 ${stats.autoObservationSkipped}`,
     );

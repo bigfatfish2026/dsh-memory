@@ -51,7 +51,24 @@ test('对账：493 = 104 + 294 + 85 + 10，不可拆算在回队里不重复计'
 test('对账：少了 inflateDead 就不等于条数（分类必须逐项加全）', () => {
   const b = {
     succeeded: 1, dedupedOnly: 0, skipped: 0, pendingAfter: 0,
-    versionMismatch: 0, coverageBlocked: 0, unavoidable: 0, inflateDead: 1,
+    versionMismatch: 0, coverageBlocked: 0, unavoidable: 0, inflateDead: 1, precheckDead: 0,
   };
   assert.equal(splitClassificationSum(b), 2);
+});
+
+test('对账：预检跳过按实际 status 落类（pending 进回队，dead 单列 precheckDead）', () => {
+  // 预检不计 attempts 之后正常落 pending：回队 +1，precheckDead 保持 0，合计仍等于条数。
+  const ok = {
+    succeeded: 0, dedupedOnly: 0, skipped: 0, pendingAfter: 1,
+    versionMismatch: 0, coverageBlocked: 0, unavoidable: 1, inflateDead: 0, precheckDead: 0,
+  };
+  assert.equal(splitClassificationSum(ok), 1);
+
+  // 表坏/行已经被别的路径判 dead：不许先加 pendingAfter 再改，dead 类要能对得上。
+  const dead = {
+    succeeded: 0, dedupedOnly: 0, skipped: 0, pendingAfter: 0,
+    versionMismatch: 0, coverageBlocked: 0, unavoidable: 1, inflateDead: 0, precheckDead: 1,
+  };
+  assert.equal(splitClassificationSum(dead), 1, 'precheckDead 必须计进分类合计');
+  assert.equal(splitBreakdownOf({ ...dead, precheckDead: 1 }).precheckDead, 1);
 });

@@ -185,6 +185,14 @@ export interface RecordSplitFailureOptions {
   type?: string;
   reason?: string;
   attempt?: number;
+  /**
+   * 这次失败算不算一次尝试（默认 true，attempts+1，到 MAX_ATTEMPTS 判 dead）。
+   *
+   * false 只给「本地预检 / 判定缓存命中」这类确定性跳过用：同一份正文下一轮还是同一个结论，
+   * 根本没问模型，不该把账推到 dead。落库仍是 pending、last_error 照写、原文不动，
+   * 下一轮照常再判；正文一变键/判据就变，不需要靠 attempts 驱动重试。
+   */
+  countAttempt?: boolean;
   log?: ((line: string) => void) | null;
   now?: number;
 }
@@ -831,12 +839,16 @@ async function askParts({ llm, provider, model, sourceId, type, ts, text, feedba
 }
 
 /**
- * 一条超长记忆的拆分失败：落 pending_ops(kind='split_item')，attempts+1，按 1/5/15 分钟退避，
- * attempts>3 转 dead。原文一个字都不动。
+ * 一条超长记忆的拆分失败：落 pending_ops(kind='split_item')，按 1/5/15 分钟退避，
+ * attempts 到 MAX_ATTEMPTS 转 dead。原文一个字都不动。
+ *
+ * attempts 只在「真问过模型、真失败」时加（countAttempt 默认 true）。本地预检（正文没有合法
+ * 切点）与判定缓存命中是确定性跳过，传 countAttempt:false：落 pending、写 last_error，
+ * 但账不往前推，不会攒到第 5 次被判 dead（2026-11-23 t-mwszo23a-iwxs）。
  *
  * @returns {object|null} pending_ops 行；没表/写失败返回 null（只记日志）
  */
-export function recordSplitFailure(db: DatabaseSync | null, { sourceId, text = '', type = '', reason = 'split_fail', attempt = 0, log = null, now = Date.now() }: RecordSplitFailureOptions = {} as RecordSplitFailureOptions): Row | null {
+export function recordSplitFailure(db: DatabaseSync | null, { sourceId, text = '', type = '', reason = 'split_fail', attempt = 0, countAttempt = true, log = null, now = Date.now() }: RecordSplitFailureOptions = {} as RecordSplitFailureOptions): Row | null {
   if (!db) {
     log?.(`[split] WARN 没有 pending_ops，split_item 只记日志 item=${sourceId} reason=${reason}`);
     return null;
@@ -850,10 +862,11 @@ export function recordSplitFailure(db: DatabaseSync | null, { sourceId, text = '
       reason: String(reason).slice(0, 160),
       attempt: Number(attempt) || 0,
     }, { now });
-    const after = markOp(db, row.id as string | number, 'pending', reason, { now });
+    // increment:false 走 ledger.release：只放回 pending、attempts 原样（see ingest-queue.markOp）。
+    const after = markOp(db, row.id as string | number, 'pending', reason, { now, increment: countAttempt !== false });
     log?.(
       `[split] item=${sourceId} 未通过校验 reason=${reason} attempts=${after?.attempts ?? '?'} ` +
-        `status=${after?.status || 'pending'} 原文未动`,
+        `status=${after?.status || 'pending'}${countAttempt === false ? ' 不计尝试' : ''} 原文未动`,
     );
     return after;
   } catch (error) {
@@ -1061,10 +1074,14 @@ export async function split(opts: SplitOptions = {}): Promise<SplitResult | unde
   // 本地预检（2026-11-23，t-mwsviczp-epd3）：正文中间连一个合法切点都没有时，模型怎么问
   // 只会答 unavoidable —— 直接保留原文回队，不打这次模型调用。判据与 validateParts/
   // splitLongPart 共用 SENTENCE_MARKS（见 legalCutPoints）；有切点的一律照常送审。
+  //
+  // 这条是确定性跳过，不是一次尝试：走 countAttempt:false（attempts 不涨、永远不因此判死）。
+  // 口径只此一处——pipeline-split 前置预检调的是同一个函数、同一个参数；split-pass.ts 的
+  // 预检根本不写 pending_ops，别把两条路混算（2026-11-23 t-mwszo23a-iwxs）。
   if (!hasLegalCutPoint(source)) {
     log?.(`[split] 预检不可拆 跳过模型 item=${sourceId} len=${source.length}`);
     recordSplitFailure(db, {
-      sourceId, text: source, type, reason: 'precheck_unavoidable: 正文中没有合法切点', attempt, log,
+      sourceId, text: source, type, reason: 'precheck_unavoidable: 正文中没有合法切点', attempt, countAttempt: false, log,
     });
     return { unavoidable: true, reason: 'precheck_unavoidable: 正文中没有合法切点', parts: [], rounds: 0, precheck: true };
   }

@@ -392,6 +392,10 @@ export async function runSplitPass({
   // 答「拆不开」或干脆失败，直接留在库里不问；判据与 pipeline-split / split() 同一个
   // hasLegalCutPoint（句末标点 + 换行，排除分号与围栏/引号/括号内部）。
   // 不写进 split.state.json：将来正文变了还要重新判，写进去等于永久放弃。
+  //
+  // 口径别和消费端混算（2026-11-23 t-mwszo23a-iwxs）：split-pass 是手动/独立一轮，
+  // 跳过的条目根本不写 pending_ops，也就没有 attempts 这套账；只有 pipeline-split 的
+  // 前置预检与 split() 的预检会落 pending_ops（走 countAttempt:false，不递增 attempts）。
   const precheckTargets = targets;
   targets = targets.filter((m) => hasLegalCutPoint(m.text));
   const precheckSkipped = precheckTargets.length - targets.length;

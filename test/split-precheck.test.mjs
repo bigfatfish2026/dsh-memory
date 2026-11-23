@@ -15,7 +15,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { applySchema } from '../scripts/apply-pipeline-schema.mjs';
-import { consumeSplitOps } from '../lib/pipeline-split.js';
+import { consumeSplitOps, splitBreakdownOf, splitClassificationSum } from '../lib/pipeline-split.js';
 import { split, hasLegalCutPoint, legalCutPoints, CUT_MARKS } from '../lib/agents/split.js';
 import { enqueue } from '../lib/ingest-index.js';
 
@@ -105,10 +105,10 @@ test('无切点：split() 直接返回不可拆，不调模型，原文不动', 
   assert.equal(hasLegalCutPoint(NO_CUT_TEXT), false, '判据本身也认为是无切点');
   assert.match(logs.join('\n'), /\[split\] 预检不可拆 跳过模型 item=m_nocut len=\d+/);
 
-  // 原文与 attempts 照旧落 pending_ops：一处不丢，下一轮还能再处理。
+  // 原文照旧落 pending_ops：一处不丢，下一轮还能再处理；但预检是确定性跳过，不耗 attempts。
   const row = opRow(db, 'm_nocut');
   assert.equal(row.status, 'pending');
-  assert.equal(row.attempts, 1);
+  assert.equal(row.attempts, 0, '预检不计尝试：同一份正文不该攒到 MAX_ATTEMPTS 被判 dead');
   assert.match(String(row.last_error), /precheck_unavoidable/);
   assert.equal(JSON.parse(row.payload_json).text, NO_CUT_TEXT, '原文一个字都没动');
   db.close();
@@ -140,8 +140,36 @@ test('无切点：consumeSplitOps 前置预检，tried=0、precheckSkipped=1、o
 
   const row = opRow(db, 'm_1');
   assert.equal(row.status, 'pending');
+  assert.equal(row.attempts, 0, '预检不计尝试');
   assert.match(String(row.last_error), /precheck_unavoidable/);
   assert.equal(JSON.parse(row.payload_json).text, text);
+  db.close();
+});
+
+test('无切点：连跑 6 轮 attempts 仍是 0、status 仍 pending，不会推成 dead', async () => {
+  const { db } = tmpDb();
+  const text = NO_CUT_TEXT;
+  const store = fakeStore([{ id: 'm_loop', text }]);
+  const llm = fakeLlm();
+  enqueue(db, 'split_item', 'm_loop', { source_id: 'm_loop', text, type: 'world' });
+
+  for (let round = 1; round <= 6; round += 1) {
+    const stats = await consumeSplitOps({
+      db, store, llm, concurrency: 1, maxChars: 200, log: () => {},
+    });
+    assert.equal(stats.scanned, 1, `第 ${round} 轮照常领到这一条`);
+    assert.equal(stats.tried, 0, `第 ${round} 轮一次模型都没调`);
+    assert.equal(stats.precheckSkipped, 1);
+    assert.equal(stats.pendingAfter, 1, `第 ${round} 轮按实际 status 回队`);
+    assert.equal(stats.precheckDead, 0);
+    // 分类合计与条数对得上（预检跳过不重复入账）
+    assert.equal(splitClassificationSum(splitBreakdownOf(stats)), stats.scanned);
+  }
+  assert.equal(llm.calls.length, 0);
+
+  const row = opRow(db, 'm_loop');
+  assert.equal(row.status, 'pending', '6 轮之后仍是 pending，不许 dead');
+  assert.equal(row.attempts, 0, 'attempts 一次都没涨');
   db.close();
 });
 
