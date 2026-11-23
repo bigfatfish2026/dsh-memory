@@ -11,9 +11,12 @@
  * 一笔事务里完成：证据校验 → 写观察行（rowSeq / 向量 / 粗挂载）→ derived_from 边 →
  * 旧 observation 归档 → （可选）observe_task 登记。任何一步抛错整笔回滚，调用方拿不到半条数据。
  *
- * status 默认 'active'：证据校验（存在 / active / 实体相交）就在本笔写事务里跑过，
- * 落库那一刻观察已经「有据可查」，没有理由再把它挡在召回外。'pending_review' 从 2026-11-21 起
- * 只表示「证据后来变化、等待复核」，由复核链路写；默认召回剔除这类自动观察（isHiddenObservation）。
+ * status 默认 'active'：证据校验（存在 / active / 实体绑定）就在本笔写事务里跑过，
+ * 落库那一刻观察已经「有据可查」，没有理由再把它挡在召回外。'pending_review' 有两种来路：
+ *   ① 证据后来变化、等待复核（2026-11-21 起，由复核链路写）；
+ *   ② 本次落库时证据绑定有歧义（2026-11-23 t-mwsuyr33-2qmv）：不拒也不放行，
+ *      在本事务里把初态改成 pending_review 并标 extra.needsModelReview，交复核链路判。
+ * 默认召回剔除这类自动观察（isHiddenObservation）。
  */
 import type { DatabaseSync } from 'node:sqlite';
 import { buildNewRecord, commitWrite } from './records.js';
@@ -22,8 +25,10 @@ import { writeCoarseEntities } from './entities.js';
 import { allocRowSeq, existingRowSeq, isActive, upsertRow } from './rows.js';
 import { hasMemoryLinkTable, OBSERVATION_PENDING_REVIEW_STATUS } from '../memory-link.js';
 import { entityKeysOf, notifyEntityNamesChanged } from './observe-notify.js';
+import { evidenceBindingOf } from '../sleep/observation-sources.js';
 import { normalizeEntity } from '../shared/entity-normalize.js';
 import { dateOnly, entityList } from './types.js';
+import type { EvidenceBasis } from '../sleep/observation-sources.js';
 import type { CoarseHit, LintReview, MemoryRecord, StoreState } from './types.js';
 
 /** 本路径写入的唯一 rel；证据边方向固定为「观察 → 证据」。 */
@@ -41,6 +46,10 @@ export const OBSERVATION_EPOCH_KEY = 'observation_epoch';
 export interface ObservationInput {
   text: string;
   entities: unknown;
+  /**
+   * 证据：id 字符串，或 `{ id, basis }`（取证据时算出的命中依据，见 observation-sources 的
+   * evidenceBindingOf）。带 basis 只是把取证口径带进事务，判定仍以事务里读到的最新行为准。
+   */
   evidenceIds: unknown;
   confidence?: number;
   /** 被这条新观察取代的旧 observation id；旧条在这笔事务里归档。 */
@@ -49,6 +58,12 @@ export interface ObservationInput {
   reason?: string;
   /** 来源前缀，默认 'sleep:observe'；调用方只允许补后缀。 */
   source?: string;
+}
+
+/** 事务复验用的一条证据：id + 取证时的命中依据。 */
+export interface ObservationEvidenceRef {
+  id: string;
+  basis?: EvidenceBasis;
 }
 
 /** 可选项。 */
@@ -65,6 +80,8 @@ export interface ObservationOptions {
    * 观察本身不是证据，登记只会让刚算完的实体立刻重算一遍（自己触发自己）。
    */
   enqueueObserve?: boolean;
+  /** 日志出口；证据绑定有歧义、观察被迫转待复核时打一行（前缀 [observe]）。 */
+  log?: (line: string) => void;
 }
 
 /** 落库结果：created=false 表示命中去重，没有新增行。 */
@@ -77,6 +94,10 @@ export interface ObservationResult {
   /** 被取代并归档的旧 observation id；没传 replacesObservationId 时为 null。 */
   replaced: string | null;
   rowSeq: number | null;
+  /** 落库行的实际状态；证据绑定有歧义时会被强制成 pending_review。 */
+  status: string;
+  /** 因绑定有歧义排进待复核通道的证据 id（调用方拿去打日志）。 */
+  pendingReviewEvidence: string[];
 }
 
 /** 观察写入被拒绝的原因码。 */
@@ -138,27 +159,81 @@ function evidenceRows(d: DatabaseSync, ids: string[]): Map<string, MemoryRecord>
   return out;
 }
 
+/** 入参证据归一：字符串或 `{ id, basis }`，按 id 去重保留首次出现。 */
+function evidenceRefsOf(value: unknown): ObservationEvidenceRef[] {
+  if (!Array.isArray(value)) return [];
+  const out: ObservationEvidenceRef[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const raw = item && typeof item === 'object' && !Array.isArray(item)
+      ? (item as Record<string, unknown>)
+      : null;
+    const id = textOf(raw ? raw.id : item);
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const basis = raw?.basis && typeof raw.basis === 'object' && !Array.isArray(raw.basis)
+      ? raw.basis as EvidenceBasis
+      : undefined;
+    out.push(basis ? { id, basis } : { id });
+  }
+  return out;
+}
+
 /**
- * 证据校验：存在、active、且 entities 与本次观察有交集。
- * 全部在写事务里查，BEGIN IMMEDIATE 之后读到的是写前最新状态。
+ * 证据校验：存在、active、且实体绑定与本次观察同一口径。
+ *
+ * 逐条 active 校验与「观察实体键」这条底线不变（2026-11-23 t-mwsuyr33-2qmv 只修取证口径）：
+ *   - 记录实体键与观察键有交集 → 通过（老路径，行为不变）；
+ *   - 记录实体列为空 → 用 evidenceBindingOf 的正文整词兜底（和取证据同一份函数）：
+ *       绑不上（只是泛泛提及 / 裸子串）→ 照旧拒绝；
+ *       无歧义 → 通过；歧义（词太短、片段太短、同一词命中多个候选实体）→ 交待复核，
+ *       不在这里拒，也不静默放行。
+ *   - 记录有实体键但无交集 → 照旧拒绝（不许因为前缀相似就挂边）。
+ *
+ * 返回需要待复核的证据；拒绝仍抛 ObservationRejectedError。
  */
-function assertEvidence(d: DatabaseSync, ids: string[], observationKeys: Set<string>): void {
-  const rows = evidenceRows(d, ids);
-  for (const id of ids) {
+function assertEvidence(
+  d: DatabaseSync,
+  refs: ObservationEvidenceRef[],
+  observationKeys: Set<string>,
+): Array<{ id: string; basis: EvidenceBasis }> {
+  const rows = evidenceRows(d, refs.map((ref) => ref.id));
+  const review: Array<{ id: string; basis: EvidenceBasis }> = [];
+  const candidateKeys = [...observationKeys];
+
+  for (const ref of refs) {
+    const id = ref.id;
     const row = rows.get(id);
     if (!row) reject('EVIDENCE_MISSING', `证据记忆不存在：${id}`, id);
     if (!isActive(row)) {
       reject('EVIDENCE_INACTIVE', `证据记忆不是 active（${String(row.status || 'active')}）：${id}`, id);
     }
     const keys = entityKeysOf(entityList(row.entities));
-    if (!keys.some((key) => observationKeys.has(key))) {
-      reject(
-        'EVIDENCE_ENTITY_MISMATCH',
-        `证据记忆与本次观察没有共同实体：${id}（证据 ${keys.join(',') || '-'} / 观察 ${[...observationKeys].join(',') || '-'}）`,
-        id,
-      );
+    if (keys.some((key) => observationKeys.has(key))) continue;
+
+    // 旧行（实体列为空）：正文整词绑定，规则与 selectEntityEvidence 共用 evidenceBindingOf
+    if (keys.length === 0) {
+      const bindings = candidateKeys
+        .map((key) => evidenceBindingOf(row, key))
+        .filter((basis): basis is EvidenceBasis => Boolean(basis));
+      if (bindings.length === 1 && !bindings[0].ambiguous) continue;
+      if (bindings.length >= 1) {
+        const basis: EvidenceBasis = bindings.length > 1
+          // 同一个词能绑到不止一个候选实体：结论不唯一，排待复核
+          ? { ...bindings[0], ambiguous: true, ambiguousReason: 'multiple_entities' }
+          : bindings[0];
+        review.push({ id, basis });
+        continue;
+      }
     }
+    const hit = ref.basis ? `命中依据 ${ref.basis.rule}:${ref.basis.word}` : '无命中依据';
+    reject(
+      'EVIDENCE_ENTITY_MISMATCH',
+      `证据记忆与本次观察没有共同实体：${id}（证据 ${keys.join(',') || '-'} / 观察 ${candidateKeys.join(',') || '-'} / ${hit}）`,
+      id,
+    );
   }
+  return review;
 }
 
 /** 显式实体在 entities 表里的行：粗实体词典可能还没收录新实体，这里兜一层。 */
@@ -287,7 +362,9 @@ export async function saveObservation(
   const entities = [...new Set(entityList(input.entities))];
   if (!entities.length) reject('ENTITIES_EMPTY', 'observation 至少要有 entities');
 
-  const evidenceIds = [...new Set(entityList(input.evidenceIds))];
+  // 证据既可以是 id 字符串，也可以是取证据时带回的 { id, basis }（命中依据）
+  const evidenceRefs = evidenceRefsOf(input.evidenceIds);
+  const evidenceIds = evidenceRefs.map((ref) => ref.id);
   if (!evidenceIds.length) reject('EVIDENCE_EMPTY', 'observation 至少要有 1 条证据');
 
   // lint 在 embed 之前：不合格的正文不花 embedding 的钱（口径同 saveMemory）
@@ -308,6 +385,8 @@ export async function saveObservation(
       evidenceIds: observationEvidence(state.connect(), duplicate.id),
       replaced: null,
       rowSeq: state.rowSeqById.get(duplicate.id) ?? null,
+      status: String(duplicate.status || OBSERVATION_INITIAL_STATUS),
+      pendingReviewEvidence: [],
     };
   }
 
@@ -328,8 +407,8 @@ export async function saveObservation(
     entities,
     validFrom: '',
   });
-  // 初态 active：证据的存在/active/实体相交在本事务的 ① 已校验过；
-  // pending_review 留给「证据后来变化、待复核」，由复核链路显式传。
+  // 初态 active：证据的存在/active/实体绑定在本事务的 ① 复验过；
+  // 绑定有歧义时 ① 会把这里改成 pending_review（覆盖显式传入的状态：歧义不该静默放行）。
   record.status = opts.status || OBSERVATION_INITIAL_STATUS;
   if (input.reason) record.reason = String(input.reason);
   // extra 的落法沿用 recordToRow：非列键统一进 extra 列，读侧 rowToRecord 再展开
@@ -361,11 +440,19 @@ export async function saveObservation(
     .map((m) => (archivedRow && m.id === archivedRow.id ? archivedRow : m))
     .concat(record);
 
+  // 事务复验发现的歧义绑定：不拒，转待复核（复用复核链路的 pending_review + needsModelReview）
+  let reviewEvidence: Array<{ id: string; basis: EvidenceBasis }> = [];
+
   const rowSeq = commitWrite(state, {
     action: 'observation_save',
     work: (tx) => {
-      // ① 证据校验：任何一条不合格整笔拒绝，此时还没有任何写
-      assertEvidence(tx, evidenceIds, observationKeys);
+      // ① 证据校验：任何一条不合格整笔拒绝，此时还没有任何写。
+      //    歧义绑定不拒：下面把观察初态改成 pending_review，交复核链路判。
+      reviewEvidence = assertEvidence(tx, evidenceRefs, observationKeys);
+      if (reviewEvidence.length) {
+        record.status = OBSERVATION_PENDING_REVIEW_STATUS;
+        record.needsModelReview = true;
+      }
 
       // ② 旧观察归档：同一笔事务里直接改行，不走 archiveMemory（它会另开一笔 writeTx）
       if (archivedRow) {
@@ -393,6 +480,13 @@ export async function saveObservation(
     rowSeqId: record.id,
   });
 
+  if (reviewEvidence.length) {
+    const detail = reviewEvidence
+      .map((item) => `${item.id}:${item.basis.rule}/${item.basis.ambiguousReason || '-'}`)
+      .join(',');
+    opts.log?.(`[observe] 证据绑定有歧义，观察转待复核 id=${record.id} evidence=${detail}`);
+  }
+
   return {
     id: record.id,
     created: true,
@@ -401,5 +495,7 @@ export async function saveObservation(
     evidenceIds,
     replaced: archivedRow ? archivedRow.id : null,
     rowSeq,
+    status: String(record.status || OBSERVATION_INITIAL_STATUS),
+    pendingReviewEvidence: reviewEvidence.map((item) => item.id),
   };
 }

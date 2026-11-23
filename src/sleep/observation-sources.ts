@@ -72,13 +72,47 @@ export interface SelectEntityEvidenceOptions {
   rootsMap?: ReadonlyMap<string, SourceRoots>;
 }
 
+/** 绑定命中的规则：精确键 / 整词前缀 / 旧行正文整词。 */
+export type EvidenceBindingRule = 'exact' | 'prefix' | 'text';
+
+/**
+ * 一条证据是靠什么绑到某个实体上的（t-mwsuyr33-2qmv）。
+ *
+ * 取证据（本文件 selectEntityEvidence）和落库复验（store/observation-records）共用
+ * `evidenceBindingOf` 这一份判定，并把结果原样带进事务：事务不再只翻 memories.entities 一列。
+ */
+export interface EvidenceBasis {
+  rule: EvidenceBindingRule;
+  /** 判定用的观察实体键（normalizeEntity().norm）。 */
+  entityNorm: string;
+  /** 正文里命中的词（归一化后）。 */
+  word: string;
+  /** 可定位正文片段：命中词前后各留 BINDING_SNIPPET_PAD 个字符（exact 规则为空串）。 */
+  snippet: string;
+  /** 证据记录自己的实体键（旧行是空数组）。 */
+  entityKeys: string[];
+  /** 命中不唯一 / 片段过短：不直接拒、也不直接放行，交待复核通道。 */
+  ambiguous: boolean;
+  /** 歧义原因（word_too_short / snippet_too_short / multiple_entities…），写日志用。 */
+  ambiguousReason: string;
+}
+
 /** selectEntityEvidence 命中的一条。 */
 export interface EntityEvidenceHit {
   id: string;
   record: MemoryRecord;
   roots: string[];
   uncertain: boolean;
+  /** 命中依据；事务复验直接用这份（来源根计算等老调用方可以不给）。 */
+  basis?: EvidenceBasis;
 }
+
+/** 可定位片段窗口：命中词前后各留这么多归一化字符。 */
+export const BINDING_SNIPPET_PAD = 16;
+/** 命中词之外至少要有这么多字正文，才算「可定位片段」。 */
+export const BINDING_MIN_LOCATE_CONTEXT = 4;
+/** 短于这个长度的整词命中太容易撞词：不直接放行，交复核。 */
+export const BINDING_REVIEW_WORD_LEN = 3;
 
 /** selectEntityEvidence 的返回：items 是截断后的，total 是截断前的命中数。 */
 export interface EntityEvidenceSelection {
@@ -337,40 +371,95 @@ function wholeWordAt(text: string, at: number, len: number): boolean {
   return !WORD_CHAR.test(before) && !WORD_CHAR.test(after);
 }
 
-/** 正文里有没有这个整词：逐个出现位置查边界，不做裸 includes。 */
-function containsWholeWord(text: string, word: string): boolean {
-  if (!text || !word) return false;
-  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
-    if (wholeWordAt(text, at, word.length)) return true;
-  }
-  return false;
-}
-
 /** key 以 word 开头且 word 之后正好是词边界：'anri的' 命中 'anri'，'readonly' 不命中 'read'。 */
 function startsWithWholeWord(key: string, word: string): boolean {
   return key.startsWith(word) && !WORD_CHAR.test(key.slice(word.length, word.length + 1));
 }
 
+/** 第一个整词出现位置；没有返回 -1。 */
+function firstWholeWordAt(text: string, word: string): number {
+  if (!text || !word) return -1;
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (wholeWordAt(text, at, word.length)) return at;
+  }
+  return -1;
+}
+
+/** 命中词前后各留 BINDING_SNIPPET_PAD 个字符：落库复验与日志都拿这段判断「可定位」。 */
+function snippetAt(text: string, at: number, len: number): string {
+  const from = Math.max(0, at - BINDING_SNIPPET_PAD);
+  const to = Math.min(text.length, at + len + BINDING_SNIPPET_PAD);
+  return text.slice(from, to);
+}
+
+/** 片段里命中词之外的字符数：太少就定位不到，按歧义交复核。 */
+function locateContextOf(text: string, at: number, len: number): number {
+  const from = Math.max(0, at - BINDING_SNIPPET_PAD);
+  const to = Math.min(text.length, at + len + BINDING_SNIPPET_PAD);
+  return Math.max(0, to - from - len);
+}
+
 /**
- * 实体匹配：只认三种，全部按规范化键 + 词边界判定，不做裸子串。
+ * 一条记录绑到观察实体键的依据；绑不上返回 null。
  *
- * 1) 记录实体键与观察键归一化后相等 —— 和 assertEvidence 的精确键交集同一口径；
- * 2) 记录实体键以观察键为「完整词前缀」（观察键长度 ≥3，且正文里作为独立词出现）：
- *    'Anri 的' 归一化成 'anri的'，命中 'anri'；'readonly' 不命中 'read'（'read' 后面还粘着 'o'）。
- *    方向只从观察键往记录键看：'src/shared/notify.ts' 不会命中 'notify.ts'（记录键不以它开头）；
- * 3) 老条目（entities 列没有可比实体键）正文整词兜底。
+ * 规则与 selectEntityEvidence 完全同一份（取证据和事务复验共用，2026-11-23 t-mwsuyr33-2qmv）：
+ * 1) 记录实体键与观察键归一化后相等 → exact；
+ * 2) 记录实体键以观察键为「完整词前缀」且正文里观察键作为独立词出现（观察键长度 ≥3）→ prefix；
+ * 3) 老记录实体列为空：正文整词兜底 → text。
  *
- * 有实体键的行不走 3)：纯正文命中拿不到精确键交集，落库时必然被 assertEvidence 拒
- * （logs/memory_sleep.log 2026-11-22 的 bash / echo / 任务书 等 EVIDENCE_ENTITY_MISMATCH 就是这类）。
+ * text 规则额外算歧义标记：观察键只有 2 个字符、或片段之外没有足够正文可定位，
+ * 都标 ambiguous（调用方排待复核，不直接拒也不直接放行）；正文里连整词都没出现
+ * （例如 'read' 只出现在 'readonly' 里、或只是泛泛提及）则返回 null，照旧拒绝。
+ *
+ * 前缀规则只在「记录键是观察键的完整词前缀 + 正文同样有整词」时成立，
+ * 单独的前缀相似（'tree' vs 'treehouse'）拿不到 basis。
  */
-function matchesEntity(record: MemoryRecord, norm: string): boolean {
-  if (!norm) return false;
-  const keys = entityKeysOf(entityList(record.entities));
-  if (keys.includes(norm)) return true;
-  const text = foldForMatch(String(record.text ?? ''));
-  if (!containsWholeWord(text, norm)) return false;
-  if (norm.length >= 3 && keys.some((key) => startsWithWholeWord(key, norm))) return true;
-  return keys.length === 0 && norm.length >= 2;
+export function evidenceBindingOf(record: MemoryRecord, norm: string): EvidenceBasis | null {
+  const key = String(norm ?? '').trim();
+  if (!key) return null;
+  const keys = entityKeysOf(entityList(record?.entities));
+  if (keys.includes(key)) {
+    return {
+      rule: 'exact',
+      entityNorm: key,
+      word: key,
+      snippet: '',
+      entityKeys: keys,
+      ambiguous: false,
+      ambiguousReason: '',
+    };
+  }
+  const text = foldForMatch(String(record?.text ?? ''));
+  const at = firstWholeWordAt(text, key);
+  if (at < 0) return null;
+  const snippet = snippetAt(text, at, key.length);
+  if (key.length >= 3 && keys.some((item) => startsWithWholeWord(item, key))) {
+    return {
+      rule: 'prefix',
+      entityNorm: key,
+      word: key,
+      snippet,
+      entityKeys: keys,
+      ambiguous: false,
+      ambiguousReason: '',
+    };
+  }
+  // 有实体键的行不走正文兜底：纯正文命中拿不到精确键交集，口径同落库复验的老路径
+  if (keys.length > 0) return null;
+  // 正文兜底至少要 2 个字符（1 个字符太容易撞），2 个字符命中本身算歧义
+  if (key.length < 2) return null;
+  const reasons: string[] = [];
+  if (key.length < BINDING_REVIEW_WORD_LEN) reasons.push('word_too_short');
+  if (locateContextOf(text, at, key.length) < BINDING_MIN_LOCATE_CONTEXT) reasons.push('snippet_too_short');
+  return {
+    rule: 'text',
+    entityNorm: key,
+    word: key,
+    snippet,
+    entityKeys: keys,
+    ambiguous: reasons.length > 0,
+    ambiguousReason: reasons.join('+'),
+  };
 }
 
 function evidenceTimeOf(record: MemoryRecord): string {
@@ -398,23 +487,28 @@ export function selectEntityEvidence(
   const rootsMap = options.rootsMap
     ?? sourceRootsOf(list, options.links ? [...options.links] : []);
 
-  const matched = list.filter((record) => {
-    if (!isActive(record)) return false;
-    if (!['world', 'experience'].includes(normalizeType(record.type, record.tags, record.text))) return false;
-    return matchesEntity(record, entityNorm);
-  });
+  // 命中依据与命中项一起排：同一次 evidenceBindingOf 的结论既用来筛，也随 items 带回调用方
+  const matched = list
+    .map((record) => ({ record, basis: evidenceBindingOf(record, entityNorm) }))
+    .filter((item): item is { record: MemoryRecord; basis: EvidenceBasis } => {
+      if (!item.basis) return false;
+      const record = item.record;
+      if (!isActive(record)) return false;
+      return ['world', 'experience'].includes(normalizeType(record.type, record.tags, record.text));
+    });
   matched.sort((a, b) => {
-    const byTime = evidenceTimeOf(b).localeCompare(evidenceTimeOf(a));
-    return byTime !== 0 ? byTime : String(a.id).localeCompare(String(b.id));
+    const byTime = evidenceTimeOf(b.record).localeCompare(evidenceTimeOf(a.record));
+    return byTime !== 0 ? byTime : String(a.record.id).localeCompare(String(b.record.id));
   });
 
-  const items = matched.slice(0, limit).map((record) => {
+  const items = matched.slice(0, limit).map(({ record, basis }) => {
     const hit = rootsMap.get(record.id);
     return {
       id: record.id,
       record,
       roots: hit ? [...hit.roots] : [record.id],
       uncertain: hit ? hit.uncertain : true,
+      basis,
     };
   });
   return { entityKey, entityNorm, total: matched.length, items };

@@ -17,6 +17,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  BINDING_MIN_LOCATE_CONTEXT,
+  evidenceBindingOf,
   independentSourceCount,
   selectEntityEvidence,
   sourceRootsOf,
@@ -248,4 +250,56 @@ test('selectEntityEvidence：只取 active 的 world/experience，按时间倒�
   const byNorm = selectEntityEvidence(records, { entityNorm: '树莓派' });
   assert.equal(byNorm.items.length, 5);
   assert.equal(byNorm.entityNorm, '树莓派');
+});
+
+test('evidenceBindingOf：命中依据带规则/命中词/片段/现有实体键，歧义单独标（t-mwsuyr33-2qmv）', () => {
+  const exact = evidenceBindingOf(
+    { id: 'e1', text: 'Anri 今天在', entities: ['Anri'] },
+    'anri',
+  );
+  assert.equal(exact.rule, 'exact');
+  assert.equal(exact.ambiguous, false);
+  assert.deepEqual(exact.entityKeys, ['anri']);
+
+  const prefix = evidenceBindingOf(
+    { id: 'e2', text: 'Anri 的笔记本放在桌上', entities: ['Anri 的'] },
+    'anri',
+  );
+  assert.equal(prefix.rule, 'prefix', "'anri的' 以 'anri' 为完整词前缀，且正文有整词");
+  assert.match(prefix.snippet, /anri/);
+  assert.equal(prefix.ambiguous, false);
+
+  const older = evidenceBindingOf(
+    { id: 'e3', text: 'memory/memory.db 的 vec_items 共 5308 条 1024 维向量', entities: [] },
+    'vec_items',
+  );
+  assert.equal(older.rule, 'text', '空实体列走正文整词兜底');
+  assert.deepEqual(older.entityKeys, []);
+  assert.equal(older.ambiguous, false);
+  assert.match(older.snippet, /vec_items/);
+
+  // 裸子串 / 有实体键只提正文：都不给依据（照旧拒绝）
+  assert.equal(evidenceBindingOf({ id: 'g1', text: 'readonly 打开数据库', entities: [] }, 'read'), null);
+  assert.equal(evidenceBindingOf({ id: 'g2', text: 'bash 跑了一遍测试', entities: ['dsh-ego'] }, 'bash'), null);
+  assert.equal(evidenceBindingOf({ id: 'g3', text: 'treehouse 是树屋', entities: [] }, 'tree'), null);
+
+  // 歧义：片段太短（正文只剩实体词本身）
+  const tiny = evidenceBindingOf({ id: 'a1', text: 'vec_items', entities: [] }, 'vec_items');
+  assert.equal(tiny.rule, 'text');
+  assert.equal(tiny.ambiguous, true);
+  assert.match(tiny.ambiguousReason, /snippet_too_short/);
+  assert.ok('vec_items'.length - 'vec_items'.length < BINDING_MIN_LOCATE_CONTEXT);
+
+  // 歧义：2 个字符的整词命中太容易撞
+  const short = evidenceBindingOf({ id: 'a2', text: '这里提到 pi 这台机器', entities: [] }, 'pi');
+  assert.equal(short.ambiguous, true);
+  assert.match(short.ambiguousReason, /word_too_short/);
+
+  // 选证据时命中项要把依据一起带出来
+  const hit = selectEntityEvidence(
+    [{ id: 'e4', text: 'memory/memory.db 的 vec_items 共 5308 条', entities: [], type: 'world' }],
+    { entityKey: 'vec_items' },
+  ).items[0];
+  assert.equal(hit.basis.rule, 'text');
+  assert.match(hit.basis.snippet, /vec_items/);
 });

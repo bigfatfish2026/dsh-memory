@@ -43,7 +43,7 @@ import {
 } from './observation-prompt.js';
 import { parseObservationOps, validateObservationOps } from './observation-parse.js';
 import {
-  independentSourceCount, selectEntityEvidence, sourceRootsOf,
+  evidenceBindingOf, independentSourceCount, selectEntityEvidence, sourceRootsOf,
 } from './observation-sources.js';
 import {
   claimObserveTasks, completeObserveTask, entityEtypeOf, failObserveTask, hasObserveTaskTable,
@@ -55,7 +55,7 @@ import { isActive, MEMORY_COLUMNS, rowToRecord } from '../store/rows.js';
 import { dateOnly, entityList } from '../store/types.js';
 import { withTransaction } from '../shared/tx.js';
 import { normalizeEntity } from '../shared/entity-normalize.js';
-import type { EntityEvidenceHit, EvidenceLink, SourceRoots } from './observation-sources.js';
+import type { EntityEvidenceHit, EvidenceBasis, EvidenceLink, SourceRoots } from './observation-sources.js';
 import type { AcceptedObservationOp, ExistingObservationForValidation } from './observation-parse.js';
 import type { ObservationExistingRecord } from './observation-prompt.js';
 import type {
@@ -220,6 +220,13 @@ function evidenceLinksOf(db: DatabaseSync, ids: string[]): EvidenceLink[] {
   }
 }
 
+/** 证据 id → 取证时的命中依据（selectEntityEvidence / reviewEvidenceOf 都带 basis）。 */
+function evidenceBasisOf(hits: Iterable<EntityEvidenceHit>): Map<string, EvidenceBasis> {
+  const out = new Map<string, EvidenceBasis>();
+  for (const hit of hits) if (hit.basis) out.set(hit.id, hit.basis);
+  return out;
+}
+
 /** 该实体本批证据：active world/experience，按时间倒序取 limit 条，带上来源根。 */
 function evidenceFor(
   store: ObservationPassStore,
@@ -294,6 +301,8 @@ async function saveObservationOps(
   reason: string,
   ops: AcceptedObservationOp[],
   log: (line: string) => void,
+  /** 证据 id → 取证时的命中依据；事务复验用同一份口径，不用再猜 */
+  basisOf: ReadonlyMap<string, EvidenceBasis> = new Map(),
 ): Promise<{ saved: SavedObservation[]; saveError: unknown }> {
   const saved: SavedObservation[] = [];
   let saveError: unknown = null;
@@ -303,12 +312,15 @@ async function saveObservationOps(
       const res = await deps.store.saveObservation({
         text: op.text,
         entities: observationEntitiesOf(display, entityNorm),
-        evidenceIds: op.evidence,
+        evidenceIds: op.evidence.map((id) => ({ id, basis: basisOf.get(id) })),
         ...(typeof op.confidence === 'number' ? { confidence: op.confidence } : {}),
         ...(op.op === 'update' && op.replaces ? { replacesObservationId: op.replaces } : {}),
         reason,
         source: 'sleep:observe',
-      });
+      }, { log });
+      if (res.pendingReviewEvidence?.length) {
+        log(`[observe] entity=${entityKey} op=${op.op} 证据待复核 id=${res.id} evidence=${res.pendingReviewEvidence.join(',')}`);
+      }
       saved.push({
         id: res.id,
         created: res.created,
@@ -442,6 +454,7 @@ function reviewEvidenceOf(
   rootsMap: ReadonlyMap<string, SourceRoots>,
   targets: ReviewTarget[],
   skipIds: Set<string>,
+  entityNorm: string,
 ): EntityEvidenceHit[] {
   const byId = new Map<string, MemoryRecord>();
   for (const record of records) byId.set(String(record.id), record);
@@ -453,11 +466,13 @@ function reviewEvidenceOf(
       if (!record || !isActive(record)) continue;
       skipIds.add(id);
       const hit = rootsMap.get(id);
+      const basis = evidenceBindingOf(record, entityNorm);
       out.push({
         id,
         record,
         roots: hit ? [...hit.roots] : [id],
         uncertain: hit ? hit.uncertain : true,
+        ...(basis ? { basis } : {}),
       });
     }
   }
@@ -622,7 +637,7 @@ export async function runObservationPass(
         // 模型输入：当前实体的活证据 + 待复核观察自己的活证据（去重、带上来源根）
         const modelEvidence: EntityEvidenceHit[] = [...evidence.selection.items];
         const seenEvidence = new Set(allowed);
-        modelEvidence.push(...reviewEvidenceOf(deps.store.metas(), plan.rootsMap, needModel, seenEvidence));
+        modelEvidence.push(...reviewEvidenceOf(deps.store.metas(), plan.rootsMap, needModel, seenEvidence, entityNorm));
         const modelAllowed = modelEvidence.map((item) => item.id);
         const mergedRoots = new Map<string, SourceRoots>(evidence.rootsMap);
         for (const [id, roots] of plan.rootsMap) mergedRoots.set(id, roots);
@@ -687,7 +702,10 @@ export async function runObservationPass(
 
         // 先落库（模型 update），再 CAS complete；失败/冲突都不碰观察状态
         const saveResult = accepted.length
-          ? await saveObservationOps(deps, entityKey, display, entityNorm, `observe:review:${task.reason || 'review'}`, accepted, log)
+          ? await saveObservationOps(
+            deps, entityKey, display, entityNorm, `observe:review:${task.reason || 'review'}`, accepted, log,
+            evidenceBasisOf(modelEvidence),
+          )
           : { saved: [] as SavedObservation[], saveError: null as unknown };
         const saved = saveResult.saved;
         if (accepted.length && !saved.length) {
@@ -793,6 +811,7 @@ export async function runObservationPass(
       // 落库：逐条 try/catch，一条坏只记这一条，不把同批别的观察带下去
       const { saved, saveError } = await saveObservationOps(
         deps, entityKey, display, entityNorm, `observe:${task.reason || 'refresh'}`, validated.accepted, log,
+        evidenceBasisOf(evidence.selection.items),
       );
 
       if (!saved.length && validated.accepted.length) {
