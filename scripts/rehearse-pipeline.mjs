@@ -153,7 +153,8 @@ function toOpenAiMessages(system, messages) {
 }
 
 export function createRehearseLlm({ baseUrl, model, apiKey }) {
-  const usage = { calls: 0, promptTokens: 0, completionTokens: 0, cost: 0, errors: 0 };
+  // 2026-11-23：补 cacheReadTokens——工具预算 A/B 回放要比「未缓存输入 / 缓存读取 / 输出」三项。
+  const usage = { calls: 0, promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cost: 0, errors: 0 };
   return {
     usage,
     stream(request = {}) {
@@ -205,6 +206,11 @@ export function createRehearseLlm({ baseUrl, model, apiKey }) {
             if (obj.usage) {
               usage.promptTokens += Number(obj.usage.prompt_tokens) || 0;
               usage.completionTokens += Number(obj.usage.completion_tokens) || 0;
+              usage.cacheReadTokens += Number(
+                obj.usage.prompt_cache_hit_tokens
+                  ?? obj.usage.cache_read_input_tokens
+                  ?? obj.usage.prompt_tokens_details?.cached_tokens,
+              ) || 0;
               usage.cost += Number(obj.usage.cost) || 0;
             }
             const choice = obj.choices?.[0];

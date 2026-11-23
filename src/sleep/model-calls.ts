@@ -5,6 +5,9 @@ import { llmOf } from '../llm-service.js';
 import { createToolLoopGuard } from '../agent-loop.js';
 import { relatedEntries } from '../related.js';
 import { collectTurnChunks, repairToolCallIds, READ_TOOLS, runReadTool } from './tool-calls.js';
+import {
+  buildToolCheckHint, compactToolHistory, focusTermsOf, toolBudgetCfgOf, toolCheckCfgOf,
+} from './tool-budget.js';
 import { SYSTEM, SYSTEM_CONFLICT, SYSTEM_CLUSTER } from './prompts.js';
 import { conflictDecideCfgOf, decideNewBatch, DECIDE_BATCH_CAP } from './decision.js';
 import type { ChatMessage } from './tool-calls.js';
@@ -94,7 +97,28 @@ async function askModel(transcript: string, existing: MemoryView[], effort: unkn
   // 循环只在模型不再调工具时结束；原地转圈/无新信息由活性守卫中断（src/agent-loop.ts）。
   const guard = createToolLoopGuard({ log: (line: string) => log(cfg, line), label: 'sleep:askModel' } as unknown as { label?: string });
   let toolsOpen = useTools;
+  // 2026-11-23：同一个文件（一次 askModel）多轮往返共用一份累计工具上下文预算。
+  // 旧轮工具结果超过阈值后不再原文重发，只留带出处的相关片段；候选 listing 与顺序不动。
+  const budgetCfg = toolBudgetCfgOf(cfg.sleepToolBudget);
+  const checkCfg = toolCheckCfgOf(cfg.sleepToolCheck);
+  const focus = focusTermsOf(existing);
+  let toolRounds = 0;
+  let compactedTotal = 0;
+  let startHinted = false;
+  let wrapHinted = false;
   for (;;) {
+    // 发请求前先把旧轮工具结果压进预算；已压过的不重算（幂等），前缀缓存不会每轮被改写
+    if (budgetCfg.enabled) {
+      const stats = compactToolHistory(msgs, { budget: budgetCfg, focus });
+      if (stats.compacted) {
+        compactedTotal += stats.compacted;
+        log(
+          cfg,
+          `[sleep] 工具上下文预算 轮=${stats.rounds} 新增压缩=${stats.compacted}`
+            + ` token=${stats.beforeTokens}→${stats.afterTokens} 上限=${stats.budget}`,
+        );
+      }
+    }
     // 2026-11-06 t-fix-tooldup：发请求前把上几轮回填的 tool-call 再校一遍，
     // id 重复或 tool 消息对不上就地修，绝不把非法体发给上游。
     const repaired = repairToolCallIds(msgs);
@@ -151,8 +175,33 @@ async function askModel(transcript: string, existing: MemoryView[], effort: unkn
         source: { kind: 'user' },
       });
     }
+    // 定向查证（2026-11-23）：第一轮工具结果后先把火力集中到最可疑的几条；轮次用完后
+    // 只给「会改变归因/状态」的补查开口子。开关关掉时这两条提示都不注入，消息体与改前一致。
+    if (!tripped) {
+      toolRounds += 1;
+      const hintRounds = checkCfg.enabled ? checkCfg.rounds : 0;
+      if (hintRounds > 0 && !startHinted) {
+        startHinted = true;
+        msgs.push({
+          role: 'user',
+          content: [{ type: 'text', text: buildToolCheckHint('start', checkCfg) }],
+          source: { kind: 'user' },
+        });
+      }
+      if (hintRounds > 0 && !wrapHinted && toolRounds >= hintRounds) {
+        wrapHinted = true;
+        msgs.push({
+          role: 'user',
+          content: [{ type: 'text', text: buildToolCheckHint('wrap', checkCfg) }],
+          source: { kind: 'user' },
+        });
+      }
+    }
   }
   if (!out.trim()) log(cfg, `模型返回空文本，chunk 类型：${[...new Set(seen)].join(',')}`);
+  if (compactedTotal) {
+    log(cfg, `[sleep] 工具上下文预算汇总 压缩=${compactedTotal} 工具轮=${toolRounds} 上限=${budgetCfg.tokens}`);
+  }
   return out;
 }
 

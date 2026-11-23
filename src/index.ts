@@ -68,6 +68,22 @@ export interface MemoryConfig {
     model?: string;
     [key: string]: unknown;
   };
+  /** 工具循环累计上下文预算（2026-11-23）；schema 在下方，默认 4000 token。 */
+  sleepToolBudget?: {
+    enabled?: boolean;
+    tokens?: number;
+    keepRecentRounds?: number;
+    excerptChars?: number;
+    maxExcerptLines?: number;
+    [key: string]: unknown;
+  };
+  /** 定向查证提示（2026-11-23）；关掉 = 不注入提示，消息体与改前逐字节一致。 */
+  sleepToolCheck?: {
+    enabled?: boolean;
+    rounds?: number;
+    maxCallsPerRound?: number;
+    [key: string]: unknown;
+  };
   /** 实体队列（apply 里打启动行读这几个键）。 */
   entityQueue?: {
     enqueue?: boolean;
@@ -362,6 +378,51 @@ export const Config: Schema<MemoryConfig> = Schema.object({
       model: 'gemini-decision-1',
     }),
   // 2026-11-14：conflictCheckMaxCalls（一次最多检查 20 条）删了，全部检查。
+  /**
+   * 工具循环的累计上下文预算（2026-11-23）。
+   * 12:30 那轮 27 个文件 202 次请求，平均 7.5 次/文件，每轮都把旧工具结果原文重发。
+   * 同一个文件（一次 askModel）的历史工具结果累计超过 tokens 后，旧结果只保留
+   * 「出处 + 相关片段」（本地截取，不额外调模型）；最近 keepRecentRounds 轮、以及最新
+   * 一条工具结果永远保留原文。候选 listing 与顺序不动。
+   * tokens<=0 或 enabled=false = 关闭，消息体与加这层之前逐字节一致。
+   */
+  sleepToolBudget: Schema
+    .object({
+      enabled: Schema.boolean().default(true),
+      /** 累计工具片段 token 上限（默认 4000，离线回算 187 次请求约少送 50 万输入 token）。 */
+      tokens: Schema.number().step(100).min(0).default(4000),
+      /** 最近几轮工具结果保留原文（0 = 只保最新一条）。 */
+      keepRecentRounds: Schema.number().step(1).min(0).max(20).default(1),
+      /** 压缩后每条保留的片段字符数。 */
+      excerptChars: Schema.number().step(20).min(40).default(240),
+      /** 压缩后每条最多保留几行片段。 */
+      maxExcerptLines: Schema.number().step(1).min(1).max(50).default(8),
+    })
+    .default({
+      enabled: true,
+      tokens: 4000,
+      keepRecentRounds: 1,
+      excerptChars: 240,
+      maxExcerptLines: 8,
+    }),
+  /**
+   * 定向查证（2026-11-23）：把「一轮问完所有候选」改成先做 rounds 轮定向查证——
+   * 第一轮工具结果后注入一条 user 提示，要求先只查最可疑的 1-maxCallsPerRound 条
+   * （否定结论、具体路径/服务/版本、状态类），确认会改变归因或状态才继续补查；
+   * 轮次用完后注入一条收尾提示。只是提示词层，不硬拦调用；enabled=false 或 rounds=0
+   * 时两条提示都不注入，消息体与加这层之前逐字节一致。
+   */
+  sleepToolCheck: Schema
+    .object({
+      enabled: Schema.boolean().default(true),
+      rounds: Schema.number().step(1).min(0).max(10).default(3),
+      maxCallsPerRound: Schema.number().step(1).min(1).max(10).default(3),
+    })
+    .default({
+      enabled: true,
+      rounds: 3,
+      maxCallsPerRound: 3,
+    }),
   /**
    * 候选生成方式（2026-11-06 t-graph-cluster）。
    * 'graph' = 向量近邻图连通分量（默认，src/similar-graph.ts）；'entity' = 老的实体分桶

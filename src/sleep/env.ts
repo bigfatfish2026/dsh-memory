@@ -64,6 +64,25 @@ export interface SleepCfg {
   sleepPriceProbe?: unknown;
   priceClockFile?: string;
   sleepTools?: unknown;
+  /**
+   * 工具循环的累计上下文预算（2026-11-23）：同一次 askModel 里历史工具结果累计超过
+   * tokens 后，旧结果只留带出处的相关片段。schema 与默认值在 src/index.ts；这里只列键。
+   */
+  sleepToolBudget?: {
+    enabled?: unknown;
+    tokens?: unknown;
+    keepRecentRounds?: unknown;
+    excerptChars?: unknown;
+    maxExcerptLines?: unknown;
+    [key: string]: unknown;
+  };
+  /** 定向查证的轮数提示（2026-11-23）：关掉 = 不注入提示，消息体与改前逐字节一致。 */
+  sleepToolCheck?: {
+    enabled?: unknown;
+    rounds?: unknown;
+    maxCallsPerRound?: unknown;
+    [key: string]: unknown;
+  };
   sleepSplitEnabled?: unknown;
   sleepDeferInPeak?: unknown;
   sleepSummaryNotify?: unknown;

@@ -29,6 +29,22 @@ export {
 
 export { mergeToolCalls, collectTurnChunks, repairToolCallIds } from './sleep/tool-calls.js';
 
+// 工具循环累计预算 / 定向查证（2026-11-23）：纯函数，测试与回放脚本直接取
+export {
+  TOOL_BUDGET_MARK,
+  TOOL_BUDGET_DEFAULT_TOKENS,
+  TOOL_BUDGET_DEFAULT_EXCERPT_CHARS,
+  TOOL_BUDGET_DEFAULT_KEEP_ROUNDS,
+  TOOL_CHECK_DEFAULT_ROUNDS,
+  TOOL_CHECK_DEFAULT_MAX_CALLS,
+  toolBudgetCfgOf,
+  toolCheckCfgOf,
+  focusTermsOf,
+  pickRelevantLines,
+  compactToolHistory,
+  buildToolCheckHint,
+} from './sleep/tool-budget.js';
+
 export { runIngestPool } from './sleep/pool.js';
 
 // 并发口径转发（跟拆分前一样，老引用处不用改）
