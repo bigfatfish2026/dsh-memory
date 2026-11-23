@@ -205,12 +205,16 @@ test('超长段按句号再切：不问模型，切出的段全部 ≤200 且一
 });
 
 test('没有句读的硬长段：整段保留成一整段（longKept），不截断、不许模型补', async () => {
-  const HARD = '丁'.repeat(500);
+  // 2026-11-23：整条正文无切点的情形已被本地预检直接拦下（见 split-precheck.test.mjs），
+  // 这里改留一个合法切点（中间句号），让请求仍走到 validateParts，才能钉住 longKept：
+  // 模型给的 offsets 落在句中，切出来的两段都超过 200 字且段内没有句读 → 两段都整段保留。
+  const HARD = `${'丁'.repeat(250)}。${'丁'.repeat(250)}`;
   const logs = [];
   const llm = fakeLlm([() => toolChunks(JSON.stringify({ offsets: [250] }))]);
-  const result = await split({ sourceId: 'm_hard', text: HARD, llm, log: (line) => logs.push(line) });
+  const result = await split({ sourceId: 'm_hard', text: HARD, llm, log: (line) => logs.push(line), textLint: false });
+  assert.equal(llm.calls.length, 1);
   assert.equal(result.parts.length, 2);
-  assert.deepEqual(result.parts.map((p) => p.text), ['丁'.repeat(250), '丁'.repeat(250)]);
+  assert.deepEqual(result.parts.map((p) => p.text), ['丁'.repeat(250), `。${'丁'.repeat(250)}`]);
   assert.equal(result.longKept, 2, '两段都切不动，整段保留');
   assert.equal(result.parts.map((p) => p.text).join(''), HARD, '一个字都不许丢');
   assert.equal(logs.some((line) => line.includes('段落超限保留 2 段')), true);

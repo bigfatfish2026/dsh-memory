@@ -212,7 +212,7 @@ async function legacySleepPass({ dryRun = false, sinceHours = 0 }: { dryRun?: bo
     };
 
     // 阶段三：拆分——合并可能把叙事写长，超过 splitMaxChars 的在最后一次拆回「一条一件事」
-    let splitInfo = { scanned: 0, tried: 0, split: 0, failed: 0, inserted: 0, deduped: 0, archived: 0 };
+    let splitInfo = { scanned: 0, tried: 0, split: 0, failed: 0, inserted: 0, deduped: 0, archived: 0, precheckSkipped: 0 };
     if (cfg.sleepSplitEnabled !== false) {
       try {
         const { runSplitPass } = await import('../split-pass.js');
@@ -233,12 +233,14 @@ async function legacySleepPass({ dryRun = false, sinceHours = 0 }: { dryRun?: bo
           inserted: sv.inserted || 0,
           deduped: sv.deduped || 0,
           archived: sv.archived || 0,
+          precheckSkipped: sv.precheckSkipped || 0,
         };
-        if (splitInfo.tried) {
+        if (splitInfo.tried || splitInfo.precheckSkipped) {
           log(
             cfg,
             `阶段三拆分：超长${splitInfo.scanned}条 尝试${splitInfo.tried} 拆开${splitInfo.split} 失败${splitInfo.failed}` +
-              ` 入库${splitInfo.inserted} 判重${splitInfo.deduped} 归档${splitInfo.archived}`,
+              ` 入库${splitInfo.inserted} 判重${splitInfo.deduped} 归档${splitInfo.archived}` +
+              ` 预检跳过${splitInfo.precheckSkipped}`,
           );
         }
       } catch (error) {

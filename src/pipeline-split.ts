@@ -27,7 +27,7 @@
 import type { DatabaseSync } from 'node:sqlite';
 import { dueOps, markOp, MAX_ATTEMPTS, type DueOp } from './ingest-index.js';
 import { sha1Hex } from './fingerprint.js';
-import { recordSplitFailure, split } from './agents/split.js';
+import { hasLegalCutPoint, recordSplitFailure, split } from './agents/split.js';
 import { lintReviewMeta } from './lint-review.js';
 import { deleteSupersedesLink, hasMemoryLinkTable, isAutoObservation, writeSupersedesLink } from './memory-link.js';
 import {
@@ -179,6 +179,8 @@ export interface SplitStats {
   inflateDead: number;
   /** 命中「不可拆」判定缓存、没问模型的条数；省下的模型调用次数与它相同。 */
   cacheHits: number;
+  /** 本地预检判「正文没有合法切点」而没问模型的条数（2026-11-23，t-mwsviczp-epd3）。 */
+  precheckSkipped: number;
   /** 自动观察被挡在普通拆分外的条数（入口已挡，这里兜旧队列里已经入队的）。 */
   autoObservationSkipped: number;
 }
@@ -527,6 +529,7 @@ function mergeSplitStats(into: SplitStats, from: SplitStats): SplitStats {
   into.pendingAfter += from.pendingAfter;
   into.inflateDead += from.inflateDead;
   into.cacheHits += from.cacheHits;
+  into.precheckSkipped += from.precheckSkipped;
   into.autoObservationSkipped += from.autoObservationSkipped;
   into.concurrency = Math.max(into.concurrency, from.concurrency);
   return into;
@@ -656,7 +659,7 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
     inserted: 0, deduped: 0, parts: 0, rejected: 0, failed: 0, skipped: 0,
     charsBefore: 0, charsAfter: 0, concurrency: 0, versionMismatch: 0, coverageBlocked: 0,
     succeeded: 0, dedupedOnly: 0, pendingAfter: 0, inflateDead: 0,
-    cacheHits: 0, autoObservationSkipped: 0,
+    cacheHits: 0, precheckSkipped: 0, autoObservationSkipped: 0,
   };
   if (!db || !store) return stats;
   // memory_link 表在不在：一轮判一次（每条都判会刷屏）。缺表只提醒一次，边跳过、拆分照常落库。
@@ -792,6 +795,28 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
           log?.(`[split] item=${sourceId} inflate 已到 attempts=${MAX_ATTEMPTS}，op 标 dead 不再自动重试`);
           continue;
         }
+      }
+
+      // 本地预检（2026-11-23，t-mwsviczp-epd3）：正文中间没有任何合法切点（句末标点/换行，
+      // 且不在引号、括号、代码围栏内部）时，模型怎么问只会答 unavoidable——直接保留原文、
+      // 落 pending 等下一轮，不打这次模型调用。判据与 split() 共用 legalCutPoints，
+      // 有切点（哪怕边界模糊）一律照常送审，不在这里替模型做决定。
+      if (!hasLegalCutPoint(text)) {
+        stats.unavoidable += 1;
+        stats.pendingAfter += 1;
+        stats.precheckSkipped += 1;
+        failedThisRound.push(op.id);
+        recordSplitFailure(db, {
+          sourceId,
+          text,
+          type: splitTypeOf(store, payload, source),
+          reason: 'precheck_unavoidable: 正文中没有合法切点',
+          attempt: Number(op.attempts) || 0,
+          log,
+          now: nowOf(),
+        });
+        log?.(`[split] 预检不可拆 跳过模型 item=${sourceId} len=${text.length}`);
+        continue;
       }
 
       // 「不可拆」判定缓存（2026-11-22）：同一正文 + 同一字数上限 + 同一规则版本不重复问模型。
@@ -1170,7 +1195,7 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
         `落库 ${b.succeeded} 全判重 ${b.dedupedOnly} 跳过 ${b.skipped} 回队 ${b.pendingAfter}（含不可拆 ${b.unavoidable}） ` +
         `版本不符 ${b.versionMismatch} 覆盖未过 ${b.coverageBlocked} 判死 ${b.inflateDead} ` +
         `失败 ${stats.failed} 分类合计 ${sum} 缓存命中 ${stats.cacheHits} ` +
-        `自动观察跳过 ${stats.autoObservationSkipped}`,
+        `预检跳过 ${stats.precheckSkipped} 自动观察跳过 ${stats.autoObservationSkipped}`,
     );
     if (sum !== stats.scanned) {
       // 有 op 没落分类（比如 commit 抛错、行还挂在 running）：当场说清楚，别让汇总看着齐整。
@@ -1180,6 +1205,12 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
         : `多记 ${sum - stats.scanned} 条（查重复入账）`;
       log?.(`[split] WARN 分类合计 ${sum} 与条 ${stats.scanned} 不符：${diff}`);
     }
+  }
+
+  // 本地预检汇总（2026-11-23）：打过模型的条数 = tried，预检省下的调用数 = precheckSkipped。
+  // 这行与逐条的 `[split] 预检不可拆 跳过模型` 一起，方便以后按轮核数。
+  if (stats.precheckSkipped > 0) {
+    log?.(`[split] 预检不可拆 合计 n=${stats.precheckSkipped} saved_llm=${stats.precheckSkipped}`);
   }
 
   // 判定缓存统计（2026-11-22）：接了缓存就每轮打一行，命中 0 也打。

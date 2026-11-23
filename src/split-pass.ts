@@ -30,6 +30,7 @@ import {
   judgeSuspected, buildLintRedoFeedback, mergeReviewRejects, lintKeptMarker, lintReviewMeta,
 } from './lint-review.js';
 import { SELF_CONTAINED_RULES, SPLIT_RULES } from './lint-prompt.js';
+import { hasLegalCutPoint } from './agents/split.js';
 import { recordLintRejects } from './lint-reject.js';
 import { ensureDir, ensureDirFor } from './shared/fs.js';
 import {
@@ -169,6 +170,8 @@ export interface SplitPassResult {
   archived: number;
   failed: number;
   dryRun: boolean;
+  /** 本地预检判「正文没有合法切点」而没问模型的条数（2026-11-23，t-mwsviczp-epd3）。 */
+  precheckSkipped: number;
   details: Array<Record<string, unknown>>;
 }
 
@@ -385,6 +388,16 @@ export async function runSplitPass({
   if (wanted.size) targets = targets.filter((m) => wanted.has(m.id));
   if (!force) targets = targets.filter((m) => !state.ids?.[m.id]);
   targets.sort((a, b) => b.text.length - a.text.length);
+  // 本地预检（2026-11-23，t-mwsviczp-epd3）：正文中间没有合法切点的条目，模型只能
+  // 答「拆不开」或干脆失败，直接留在库里不问；判据与 pipeline-split / split() 同一个
+  // hasLegalCutPoint（句末标点 + 换行，排除分号与围栏/引号/括号内部）。
+  // 不写进 split.state.json：将来正文变了还要重新判，写进去等于永久放弃。
+  const precheckTargets = targets;
+  targets = targets.filter((m) => hasLegalCutPoint(m.text));
+  const precheckSkipped = precheckTargets.length - targets.length;
+  if (precheckSkipped > 0) {
+    appendLog(logFile, `[split] 预检不可拆 跳过模型 n=${precheckSkipped}（split-pass，正文没有合法切点）`);
+  }
 
   const details: Array<Record<string, unknown>> = [];
   const previews: Array<{ source: MemoryRecord; items: SplitPiece[] }> = [];
@@ -664,7 +677,9 @@ export async function runSplitPass({
 
   // 汇总一行：grep `[split] 并发` 看这轮开几路、条/成功/失败各几个（跟 ingest/consumeSplitOps 同口径）。
   if (targets.length) {
-    appendLog(logFile, `[split] 并发 ${Math.min(poolConc, targets.length)} 路 条 ${targets.length} 成功 ${Math.max(0, targets.length - failed)} 失败 ${failed} dryRun=${dryRun}`);
+    appendLog(logFile, `[split] 并发 ${Math.min(poolConc, targets.length)} 路 条 ${targets.length} 成功 ${Math.max(0, targets.length - failed)} 失败 ${failed} 预检跳过 ${precheckSkipped} dryRun=${dryRun}`);
+  } else if (precheckSkipped > 0) {
+    appendLog(logFile, `[split] 并发 0 路 条 0 预检跳过 ${precheckSkipped} dryRun=${dryRun}`);
   }
 
   if (dryRun && previews.length) {
@@ -693,5 +708,5 @@ export async function runSplitPass({
 
   appendLog(logFile, `本轮完成 待拆=${targets.length} 实拆=${tried} 成功=${split} 失败=${failed} dryRun=${dryRun}`);
   // scanned 的旧语义是「全库超长待拆条数」，保持不受 ids 过滤影响；只把自动观察剔出去。
-  return { scanned: all.filter((m) => m.text.length > threshold && !isAutoObservation(m)).length, tried, split, inserted, deduped, archived, failed, dryRun, details };
+  return { scanned: all.filter((m) => m.text.length > threshold && !isAutoObservation(m)).length, tried, split, inserted, deduped, archived, failed, dryRun, precheckSkipped, details };
 }

@@ -231,6 +231,8 @@ export interface SplitResult {
   dedupeDiscards?: SplitPart[];
   /** 段级自足性信号（阶段一只记，供回放统计；signalsStrict 打开时命中即判废）。 */
   signals?: SplitSignal[];
+  /** 本地预检判「正文没有合法切点」直接保留原文、没调模型（2026-11-23）。 */
+  precheck?: boolean;
 }
 
 export const SPLIT_SYSTEM = `你是记忆切分员。给你一条超长记忆，你只给切分点，正文由程序照原文切。
@@ -296,6 +298,96 @@ export const INFLATE_RATIO = 1;
 const SENTENCE_MARKS = ['。', '！', '？', '；', '\n', '…'];
 const SOFT_MARKS = ['，', '、', '：', ',', ';', ' '];
 
+/** 段级信号与预检共用的一张定界符表：引号 / 括号成对字符。 */
+const DELIMITER_PAIRS: Array<[string, string]> = [
+  ['「', '」'], ['『', '』'], ['“', '”'], ['（', '）'], ['(', ')'],
+];
+
+/**
+ * 本地预检认的合法切点（2026-11-23）：句末标点 + 换行，分号不算。
+ *
+ * 为什么不直接用 SENTENCE_MARKS：那是「超长段由代码二切」的宽松口径，允许在分号后切；
+ * 模型侧规则（SPLIT_SYSTEM 第 5 条 / SPLIT_RULES）明确「切点只在句号或换行之后，
+ * 不许切在分号之后」。预检是为了预判模型的结论，所以按**模型侧规则**收窄，
+ * 直接从 SENTENCE_MARKS 过滤出同一份边界，不另立一套表。
+ */
+export const CUT_MARKS = SENTENCE_MARKS.filter((mark) => mark !== '；');
+
+/** 切点不许落在这些定界符内部：引号 / 括号 / 代码围栏（与 SPLIT_RULES、delimiterBalance 同一张表）。 */
+const CUT_QUOTE_PAIRS: Array<[string, string]> = [...DELIMITER_PAIRS, ['"', '"']];
+
+/**
+ * 标出「受保护」字符位：代码围栏内、引号内、括号内。
+ * 只用于预检判切点，不改正文、不影响 validateParts 的校验口径。
+ *
+ * 只保护**成对**的定界符：正文里孤零零一个直双引号（正则字符类 `[^\s'"]` 那种）
+ * 不许把后面整段都吞成「引号内」——回放就抓到一条：`remind-sender.js:99。` 明明有
+ * 合法切点，却被一个没配对的 `"` 保护到末尾，整条被误拦。未闭合的围栏/引号/括号
+ * 一律不产生保护，方向是「宁可少拦一条，也不把该拆的漏掉」。
+ */
+function protectedMask(text: string): boolean[] {
+  const mask = new Array(text.length).fill(false);
+  // ① 代码围栏：成对的 ``` 到 ``` 之间整段受保护（含围栏行本身）；没闭合就整段不算围栏
+  let i = 0;
+  while (i < text.length) {
+    if (text.startsWith('```', i)) {
+      const close = text.indexOf('```', i + 3);
+      if (close < 0) break;
+      for (let k = i; k < close + 3; k += 1) mask[k] = true;
+      i = close + 3;
+      continue;
+    }
+    i += 1;
+  }
+  // ② 引号/括号：先配对（栈），配上的记区间，没配上的字符不留任何保护
+  const stack: Array<{ close: string; at: number }> = [];
+  const spans: Array<[number, number]> = [];
+  for (let k = 0; k < text.length; k += 1) {
+    if (mask[k]) continue; // 围栏内的字符不参与配对
+    if (text.startsWith('```', k)) { k += 2; continue; }
+    const ch = text[k];
+    const top = stack[stack.length - 1];
+    // 栈顶就是它要的闭字符：这里当闭合（直双引号两边同字符，靠这个区分开与闭）
+    if (top && top.close === ch) {
+      spans.push([top.at, k]);
+      stack.pop();
+      continue;
+    }
+    const opener = CUT_QUOTE_PAIRS.find(([open]) => open === ch);
+    if (opener) stack.push({ close: opener[1], at: k });
+  }
+  for (const [start, end] of spans) {
+    for (let k = start; k <= end; k += 1) mask[k] = true;
+  }
+  return mask;
+}
+
+/**
+ * 正文里所有合法切点的偏移（在切点字符之后，1..len-1）。
+ *
+ * 判据与模型侧规则一致：切点落在句末标点或换行之后；不在引号/括号/代码围栏内部；
+ * 切点两侧 trim 后都非空。返回空数组 = 这条正文怎么切都只能切出空段或半句，
+ * 模型只会答 unavoidable —— 调用方应当跳过模型调用。
+ */
+export function legalCutPoints(text: unknown): number[] {
+  const source = String(text ?? '');
+  if (source.length < 2) return [];
+  const mask = protectedMask(source);
+  const out: number[] = [];
+  for (let at = 1; at < source.length; at += 1) {
+    const mark = source[at - 1];
+    if (mask[at - 1] || !CUT_MARKS.includes(mark)) continue;
+    if (!source.slice(0, at).trim() || !source.slice(at).trim()) continue;
+    out.push(at);
+  }
+  return out;
+}
+
+/** 预检的唯一入口：正文中间有没有合法切点。 */
+export function hasLegalCutPoint(text: unknown): boolean {
+  return legalCutPoints(text).length > 0;
+}
+
 
 function fail(reason: string, extra: Record<string, unknown> = {}): ValidatePartsResult {
   return { ok: false, reason, ...extra };
@@ -333,10 +425,6 @@ function countOf(text: string, needle: string): number {
   }
   return n;
 }
-
-const DELIMITER_PAIRS: Array<[string, string]> = [
-  ['「', '」'], ['『', '』'], ['“', '”'], ['（', '）'], ['(', ')'],
-];
 
 /**
  * 定界符配平（2026-11-20 P0 阶段一信号）：每段内引号、括号成对，代码围栏出现偶数次。
@@ -970,6 +1058,16 @@ export async function split(opts: SplitOptions = {}): Promise<SplitResult | unde
   } = opts;
   const source = String(text ?? '').trim();
   if (!source) throw new Error('split: text 为空');
+  // 本地预检（2026-11-23，t-mwsviczp-epd3）：正文中间连一个合法切点都没有时，模型怎么问
+  // 只会答 unavoidable —— 直接保留原文回队，不打这次模型调用。判据与 validateParts/
+  // splitLongPart 共用 SENTENCE_MARKS（见 legalCutPoints）；有切点的一律照常送审。
+  if (!hasLegalCutPoint(source)) {
+    log?.(`[split] 预检不可拆 跳过模型 item=${sourceId} len=${source.length}`);
+    recordSplitFailure(db, {
+      sourceId, text: source, type, reason: 'precheck_unavoidable: 正文中没有合法切点', attempt, log,
+    });
+    return { unavoidable: true, reason: 'precheck_unavoidable: 正文中没有合法切点', parts: [], rounds: 0, precheck: true };
+  }
   // 结构校验只做一次；正文 lint 的重做仍是**独立的一次** askParts（内容纠错，不是失败重试），
   // 不加多轮循环——每个 agent 只支持这一次重做（ 再确认）。
   const rounds = 1;

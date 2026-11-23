@@ -299,7 +299,8 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
         curateStats.split = {
           scanned: sv.scanned, inserted: sv.inserted, deduped: sv.deduped, archived: sv.archived,
           failed: sv.failed, succeeded: sv.succeeded, pendingAfter: sv.pendingAfter, concurrency: sv.concurrency,
-          cacheHits: sv.cacheHits, autoObservationSkipped: sv.autoObservationSkipped,
+          cacheHits: sv.cacheHits, precheckSkipped: sv.precheckSkipped,
+          autoObservationSkipped: sv.autoObservationSkipped,
         };
         return sv;
       } catch (error) {
@@ -399,7 +400,7 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
           `回队 ${splitSv.pendingAfter || 0}（含不可拆 ${splitSv.unavoidable || 0}） 版本不符 ${splitSv.versionMismatch || 0} ` +
           `覆盖未过 ${splitSv.coverageBlocked || 0} 判死 ${splitSv.inflateDead || 0} ` +
           `失败 ${splitSv.failed || 0} 缓存命中 ${splitSv.cacheHits || 0} ` +
-          `自动观察跳过 ${splitSv.autoObservationSkipped || 0}`,
+          `预检跳过 ${splitSv.precheckSkipped || 0} 自动观察跳过 ${splitSv.autoObservationSkipped || 0}`,
       );
     }
     const revokeArchived = compactStats.revoked || 0;

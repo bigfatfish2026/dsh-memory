@@ -59,7 +59,9 @@ const brokenChunks = () => [
   { type: 'finish', reason: { kind: 'stop' } },
 ];
 
-const SRC = `${'A'.repeat(50)}${'B'.repeat(50)}`;
+// 2026-11-23：正文中间必须有一个合法切点（句号），否则本地预检会直接拦下、根本走不到
+// 模型失败重试这条路径——本文件钉的是「模型给了坏锚串/坏 JSON 之后怎么重试」，不是预检。
+const SRC = `${'A'.repeat(50)}。${'B'.repeat(50)}`;
 const CUTS = ['B'.repeat(8)];
 
 test('切分点协议：正文全来自原文，charsAfter === charsBefore，INFLATE_RATIO 就是 1', () => {

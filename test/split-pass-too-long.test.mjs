@@ -25,7 +25,9 @@ const MEMORY_DDL = `CREATE TABLE memories (
 
 const SENTENCE = '树莓派温度四十五度风扇转速三千转磁盘用了百分之十五内存还剩两吉字节负载一点二持续了六小时';
 const longText = (n) => SENTENCE.repeat(Math.ceil(n / SENTENCE.length)).slice(0, n);
-const SOURCE = longText(300);
+// 2026-11-23：正文中间要有一个合法切点（句号），否则本地预检会把它挡在模型调用之前，
+// 本文件钉的是「超长子段入队继续拆」，不是预检。LONG_PART 仍保持无标点的 260 字原样。
+const SOURCE = `${longText(80)}。${longText(219)}`;
 const SHORT_PART = `${SENTENCE.slice(0, 80)}。`;
 const LONG_PART = longText(260);
 
