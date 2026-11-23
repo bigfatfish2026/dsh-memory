@@ -166,8 +166,53 @@ function scoreLine(line: string, focus: string[]): number {
 }
 
 /**
+ * 一行里「为什么被选中」的位置（2026-11-23 t-mwszo23a-iwxs）：focus 词优先，其次具体路径、
+ * 票号、id=、否定结论。返回 -1 表示没有可定位的命中，长度裁剪就退回旧行为（留开头）。
+ *
+ * 只用于截取窗口，不参与打分——打分的口径仍是 scoreLine。
+ */
+function hitAtOf(line: string, focus: string[]): number {
+  const lower = line.toLowerCase();
+  let best = -1;
+  const consider = (at: number): void => {
+    if (at >= 0 && (best < 0 || at < best)) best = at;
+  };
+  for (const f of focus) {
+    if (f.length < 2) continue;
+    consider(lower.indexOf(f.toLowerCase()));
+  }
+  if (best >= 0) return best;
+  for (const re of [PATH_RE, TICKET_RE, ID_RE, NEGATIVE_RE]) {
+    const at = re.exec(line)?.index ?? -1;
+    consider(at);
+  }
+  return best;
+}
+
+/**
+ * 长行按命中位置取前后窗口（片段不再固定取开头）：命中在 chars 之后时窗口跟着挪，
+ * 命中的那一词一定留在窗口里；窗口两侧被截断就加省略号。
+ *
+ * 只在行比 chars 长时动手；短行原样返回。总长度 ≤ chars（两个省略号占 2 字）。
+ */
+function windowAt(line: string, at: number, chars: number): string {
+  const room = Math.max(1, chars - 2); // 两侧省略号各算 1 字
+  if (at < 0 || at + 1 <= room) return clip(line, chars);
+  const before = Math.min(at, Math.floor(room / 3));
+  let from = Math.max(0, at - before);
+  let to = Math.min(line.length, from + room);
+  if (to - from < room) from = Math.max(0, to - room);
+  const head = from > 0 ? '…' : '';
+  const tail = to < line.length ? '…' : '';
+  return `${head}${line.slice(from, to)}${tail}`;
+}
+
+/**
  * 从一段工具结果里挑相关行：打分从高到低、按原顺序输出，直到字符或行数上限。
  * 纯本地，稳定可复现（同样的输入永远同样的输出，缓存不受抖动影响）。
+ *
+ * 长单行（整段没有换行）以前只留开头 chars 字，靠末尾内容得分最高的那一行等于丢掉关键修订；
+ * 现在按命中位置取前后窗口（2026-11-23 t-mwszo23a-iwxs），token 预算逻辑不在这里改。
  */
 export function pickRelevantLines(
   text: unknown,
@@ -192,7 +237,10 @@ export function pickRelevantLines(
     if (used >= chars) break;
   }
   picked.sort((a, b) => a.index - b.index);
-  const out = picked.map((x) => x.line).join('\n');
+  const parts = picked.map((x) => windowAt(x.line, hitAtOf(x.line, focus), chars));
+  // 单行已经按窗口裁过（没命中时 clip 自带「截断」后缀），别再裁第二刀。
+  if (parts.length === 1) return parts[0];
+  const out = parts.join('\n');
   return out.length > chars ? clip(out, chars) : out;
 }
 

@@ -192,3 +192,25 @@ test('定向查证提示：start 写清轮数与每轮条数，wrap 收口，关
   assert.match(wrap, /定向查证轮次已到/);
   assert.match(wrap, /归因或状态/);
 });
+
+test('长单行：命中在 240 字之后时窗口跟着挪，关键修订不被截掉（t-mwszo23a-iwxs）', () => {
+  // 整段没有换行：旧实现 clip 开头 240 字，末尾的实体 + 否定结论全丢。
+  const filler = '值班记录里的普通一行，没有任何实体与结论。'.repeat(20); // > 400 字
+  const line = `${filler}最终结论：树莓派装不上 node-sqlite，改用内置 sqlite。`;
+  const picked = pickRelevantLines(line, ['树莓派'], 240, 8);
+
+  assert.match(picked, /树莓派装不上/, '命中词与它后半句必须留在片段里');
+  assert.ok(picked.length <= 240, `片段不许超过 ${240} 字，实际 ${picked.length}`);
+  assert.ok(!picked.startsWith('值班记录'), '不再固定取开头');
+  assert.ok(picked.startsWith('…') && picked.endsWith('。'), '两侧被截断要留省略号');
+
+  // 短行、多行逻辑与原来一致：短行原样输出。
+  assert.equal(pickRelevantLines('树莓派温度 45 度', ['树莓派'], 240, 8), '树莓派温度 45 度');
+  const many = ['普通一行', '树莓派温度 45 度', '另一行'].join('\n');
+  assert.match(pickRelevantLines(many, ['树莓派'], 200, 3), /树莓派温度/);
+
+  // 命中就在开头附近：窗口不挪，仍从开头起（与旧 clip 行为一致）。
+  const head = pickRelevantLines(`树莓派 ${filler}`, ['树莓派'], 240, 8);
+  assert.ok(head.startsWith('树莓派'), '命中在窗口内就别白挪');
+  assert.match(head, /截断，共 \d+ 字/, '没命中要挪时仍走原来的 clip 口径');
+});
