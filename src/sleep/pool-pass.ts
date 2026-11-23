@@ -16,6 +16,9 @@ import {
   formatIngestAdaptiveLog, formatStageAdaptiveLog, formatPoolSummary,
 } from '../concurrency.js';
 import { dayKey } from './slots.js';
+import {
+  readItemReviewCache, mergeItemReviewCache, persistItemReviewCache,
+} from '../item-review-cache.js';
 import { runObservationPass } from './observation-pass.js';
 import type { ObservationPassOutcome, ObservationPassStore } from './observation-pass.js';
 import type { AskObservationResult } from './model-calls.js';
@@ -370,6 +373,17 @@ pooledSleepPass = async function pooledSleepPass({ dryRun = false, sinceHours = 
     // 必须「老条目 + 本轮新结论」一起写，别拿本轮那几条把主文件整个覆盖掉。
     if (!dryRun && Object.keys(mergeCache).length) {
       persistOrganizeCache({ ...(stateStore.load().organizeCache || {}), ...mergeCache } as Record<string, CacheValue>);
+    }
+    // ④' 条目级复审结论（2026-11-23）：本轮 merge 池记下的条目关系并进 itemReviewCache。
+    // 老条目 + 本轮增量一起写，别拿本轮几条覆盖整张表；轮转复用 organizeCache 那套（按 t 留最近 N 条）。
+    if (!dryRun) {
+      const itemAdditions = env.scheduler.itemReviewCache();
+      const addedCount = Object.keys(itemAdditions).length;
+      if (addedCount) {
+        const mergedItemCache = mergeItemReviewCache(readItemReviewCache(stateStore), itemAdditions);
+        const kept = persistItemReviewCache(stateStore, mergedItemCache, { cfg: cfg as never, log: (line) => log(cfg, line) });
+        log(cfg, `[item-review] 条目缓存 本轮新增 ${addedCount} 条，主文件留 ${kept} 条`);
+      }
     }
 
     // ⑤ 汇总（各通道各一行，最后一行总账）

@@ -11,6 +11,11 @@ import { llmOf } from '../llm-service.js';
 import { isAutoObservation } from '../memory-link.js';
 import { dayKey } from './slots.js';
 import { CLUSTER_PROMPT_SHELL_TOKENS } from './batching.js';
+import { cheapSimilarity, cosine } from '../batch-planner.js';
+import {
+  readItemReviewCache, itemReviewHit, shrinkClusterForReview, reviewAdditionsFromOps,
+} from '../item-review-cache.js';
+import type { ReviewItem, ItemReviewCache } from '../item-review-cache.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { DueOp } from '../ingest-index.js';
 import type { MemoryRecord, MemoryView, SnapshotView, Row } from '../store/types.js';
@@ -38,7 +43,11 @@ interface PoolEnv {
   agentOps: { applyAgentOps: (ops: AgentOp[], opts: { cluster: AgentClusterItem[]; dryRun: boolean; fp: string }) => Promise<{ merged: unknown[]; updated: unknown[]; archived: unknown[]; added: unknown[]; rejected: unknown[]; split: unknown[] }> };
   replay: { replayPendingOps: (opts: { dryRun?: boolean; onlyOps?: DueOp[] | null }) => Promise<Record<string, unknown>> };
   actions: { revocationPass: (opts?: { dryRun?: boolean }) => Promise<{ scanned: number; archived: unknown[]; skipped: unknown[]; orphan: unknown[] }> };
-  scheduler: { putMergeResult: (label: string, value: { v: string; t: number }) => unknown };
+  scheduler: {
+    putMergeResult: (label: string, value: { v: string; t: number }) => unknown;
+    /** 本轮条目级复审结论（收尾并进 state 的 itemReviewCache）；老装配没这个方法就跳过。 */
+    putItemReview?: (additions: ItemReviewCache) => unknown;
+  };
   activeSnap: () => SnapshotView;
   budgetOf: () => PromptBudget;
   batchPlannerOf: (budgetTokens?: number) => BatchPlanner;
@@ -254,8 +263,13 @@ function planPoolQueues(db: DatabaseSync, { dryRun, lastSleepAt }: { dryRun: boo
   const vecOf = snap.vecOf;
   const { window: promptWindow, budget: promptTokens } = budgetOf();
   const batchBudget = promptWindow ? Math.max(0, promptTokens - CLUSTER_PROMPT_SHELL_TOKENS) : 0;
-  // 与两处 organizePass 共用同一份「聚类→切批→漏斗→查缓存」；缓存命中的批不进队。
-  const batchPlan = batchPlannerOf(batchBudget).plan({ all, vecOf, cache: stateStore.load().organizeCache || {} });
+  // 与两处 organizePass 共用同一份「聚类→切批→漏斗→增量复审→查缓存」；缓存命中的批不进队。
+  const batchPlan = batchPlannerOf(batchBudget).plan({
+    all,
+    vecOf,
+    cache: stateStore.load().organizeCache || {},
+    itemCache: readItemReviewCache(stateStore),
+  });
   out.batches = batchPlan.batches.length;
   out.funnel = batchPlan.funnel;
   out.cached += batchPlan.cached;
@@ -341,7 +355,7 @@ async function prepareMergeBatchOp(op: DueOp): Promise<MergeBox> {
   const snap = activeSnap();
   const active = snap.list;
   const byId = snap.byId;
-  const cluster = ids.map((id) => byId.get(id)).filter(Boolean) as unknown as MemoryView[];
+  let cluster = ids.map((id) => byId.get(id)).filter(Boolean) as unknown as MemoryView[];
   if (cluster.length < 2) return { skip: 'stale_members', batchLabel };
   const itemOf = (m: MemoryView) => ({
     id: String(m.id),
@@ -355,10 +369,33 @@ async function prepareMergeBatchOp(op: DueOp): Promise<MergeBox> {
   const groupIds = Array.isArray(payload.groups) && payload.groups.length > 1
     ? payload.groups.map((g) => (Array.isArray(g) ? g.map(String) : []))
     : null;
+  // 增量复审（2026-11-23）：老 pending 行里记的是当时那批成员，重放/消费前按条目缓存再收一次——
+  // 逐字未变、已审过的条目不再送审，只送变化项 + 它们最相关的旧邻居。全批都已审过就当场收口。
+  const itemCache = readItemReviewCache(stateStore);
+  const relate = (a: ReviewItem, b: ReviewItem): number => {
+    const va = a?.vector || (snap.vecOf && snap.vecOf.get(String(a?.id)));
+    const vb = b?.vector || (snap.vecOf && snap.vecOf.get(String(b?.id)));
+    if (va && vb) {
+      const c = cosine(va, vb);
+      if (c !== null) return c;
+    }
+    return cheapSimilarity(a as never, b as never);
+  };
   let groups = null;
   if (groupIds) {
     const resolved = groupIds.map((g) => g.map((id) => byId.get(id)).filter(Boolean) as unknown as MemoryView[]);
-    if (resolved.every((g) => g.length === 2)) groups = resolved;
+    if (resolved.every((g) => g.length === 2)) {
+      // 组内一条变化都没有 = 这一组两两已审过，整组不送
+      const kept = resolved.filter((g) => g.some((m) => !itemReviewHit(itemCache, m as unknown as ReviewItem)));
+      if (!kept.length) return { skip: 'item_settled', batchLabel };
+      groups = kept;
+      cluster = [...new Map(kept.flat().map((m) => [String(m.id), m])).values()];
+    }
+  }
+  if (!groups) {
+    const shrunk = shrinkClusterForReview(cluster as unknown as ReviewItem[], itemCache, { relate });
+    if (shrunk.cluster.length < 2) return { skip: 'item_settled', batchLabel };
+    cluster = shrunk.cluster as unknown as MemoryView[];
   }
   const candidates = candidateListFor(cluster, active);
   const box: MergeBox = { batchLabel, cluster, groups, answer: null, kind: '', summary: '' };
@@ -416,6 +453,10 @@ async function commitPackedMerge(op: DueOp, box: MergeBox, ops: unknown[]): Prom
         for (const k of Object.keys(merged)) if (Array.isArray(applied[k as keyof typeof applied])) merged[k].push(...applied[k as keyof typeof applied]);
         done = applied.merged.length + applied.updated.length + applied.archived.length
           + applied.added.length + applied.split.length;
+        // 条目级结论：组内看过的每条都记；被打回的 id 不记（还得重问）
+        env.scheduler.putItemReview?.(reviewAdditionsFromOps(groups[i] as unknown as ReviewItem[], checked.valid, {
+          rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+        }));
         acted += done;
       }
     }
@@ -467,6 +508,8 @@ async function commitMergeBatchOp(op: DueOp, box: MergeBox | null | undefined): 
   if (!ops.length) {
     // 模型明确空 ops = 有效 noop：记缓存、终态 done，不耗 attempts
     env.scheduler.putMergeResult(batchLabel, { v: 'noop', t: Date.now() });
+    // 条目级也记：这批每条都「看过、不用动」，下一轮同内容不再重送
+    env.scheduler.putItemReview?.(reviewAdditionsFromOps(box.cluster as unknown as ReviewItem[], []));
     markOp(store.db(), op.id, 'done', 'noop', { log: (line: string) => log(cfg, line) });
     return { noop: true };
   }
@@ -489,6 +532,10 @@ async function commitMergeBatchOp(op: DueOp, box: MergeBox | null | undefined): 
   const acted = applied.merged.length + applied.updated.length + applied.archived.length
     + applied.added.length + applied.split.length;
   env.scheduler.putMergeResult(batchLabel, { v: acted ? 'acted' : 'noop', t: Date.now() });
+  // 条目级结论：看过的每条都记；被打回/被写入闸挡下的 id 不记
+  env.scheduler.putItemReview?.(reviewAdditionsFromOps(box.cluster as unknown as ReviewItem[], checked.valid, {
+    rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+  }));
   markOp(store.db(), op.id, acted ? 'done' : 'pending', acted ? null : 'noop', { log: (line: string) => log(cfg, line) });
   return { acted, applied };
 }

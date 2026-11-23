@@ -13,9 +13,15 @@
  *      连「可能是同一件事」的结构条件都不满足的批，砍掉。
  *   L3 送模型：剩下的批按 score 降序，受可选 maxBatches 上限（0=不限）。
  *
+ * 过了漏斗还有一道「增量复审」（2026-11-23，t-mwsvibwz-f9ve）：送模型前按条目级缓存
+ * （src/item-review-cache.ts）把逐字未变、已审过的成员摘掉，只留变化项 + 它们最相关的旧邻居。
+ * 聚类和漏斗本身不动——「全库找邻居」照旧在 clusterOf 里做完。
+ *
  * 每一级都由 organizeFunnelMode 控制：off（默认）/ l0 / l1 / l2（'on' 等同 l2）。
  * off 时 plan() 的产物与改造前逐条一致（回归锁见 test/batch-planner.test.mjs）。
  */
+import { shrinkClusterForReview } from './item-review-cache.js';
+import type { ItemReviewCache, ReviewItem } from './item-review-cache.js';
 /** 批次里的一条记忆：候选自带 id/text/vector，其余字段按来源可能有。 */
 export interface MemoryClusterItem {
   id?: string | number;
@@ -67,6 +73,15 @@ export interface PlanFunnel {
   packedBatches?: number;
   packedGroups?: number;
   packRequests?: number;
+  /** 增量复审：送审前的条目数 / 实际送审条目数 / 被复用的已审条目数（962→M 的账）。 */
+  itemsIn?: number;
+  itemsOut?: number;
+  itemsSettled?: number;
+  /** 被收缩过 / 整批都已审过不用送的批数。 */
+  itemShrunkBatches?: number;
+  itemSettledBatches?: number;
+  /** 收缩后只剩 1 条、凑不成一对而跳过的批数（不是缓存命中）。 */
+  itemSkippedBatches?: number;
 }
 
 /** 一轮规划的结果。 */
@@ -100,6 +115,8 @@ export interface BatchPlannerSpec {
   packSize?: number;
   packMinSpanDays?: number;
   packMaxSpanDays?: number;
+  /** 增量复审：每个变化项最多带几个旧邻居一起送（默认 2；0 = 只送变化项）。 */
+  itemNeighborLimit?: number;
   log?: (line: string) => void;
 }
 
@@ -107,7 +124,7 @@ export interface BatchPlannerSpec {
 export interface BatchPlanner {
   mode: string;
   level: number;
-  plan: (opts?: { all?: MemoryClusterItem[]; vecOf?: VecLookup | null; cache?: Record<string, unknown> }) => PlanResult;
+  plan: (opts?: { all?: MemoryClusterItem[]; vecOf?: VecLookup | null; cache?: Record<string, unknown>; itemCache?: ItemReviewCache }) => PlanResult;
 }
 
 export const FUNNEL_MODES = Object.freeze(['off', 'l0', 'l1', 'l2']);
@@ -363,12 +380,15 @@ export function createBatchPlanner({
   packSize = 0,
   packMinSpanDays = 1,
   packMaxSpanDays = 30,
+  itemNeighborLimit = 2,
   log = () => {},
 }: Partial<BatchPlannerSpec> = {}): BatchPlanner {
   if (typeof clusterOf !== 'function' || typeof splitBatches !== 'function' || typeof fingerprint !== 'function') {
     throw new Error('batch-planner: clusterOf / splitBatches / fingerprint 都是必填');
   }
   const level = funnelLevelOf(mode);
+  /** plan() 内的向量表：relateItems 用（每轮重设一次，不跨轮留旧快照）。 */
+  let vecOfRef: VecLookup | null = null;
 
   /** L0：批内精确去重，返回 {cluster, dropped}。 */
   function applyL0(cluster: MemoryClusterItem[]): { cluster: MemoryClusterItem[]; dropped: number } {
@@ -417,10 +437,25 @@ export function createBatchPlanner({
   }
 
   /**
-   * 一轮规划：聚类 → 切批 → 漏斗 → 查缓存挑批。
+   * 条目两两相似度：两边都有向量用余弦，缺向量退回廉价字面相似度。
+   * 「最相关的旧邻居」就按这个挑（与漏斗里 pairCos/cheap 同一套度量，不另写一版）。
+   */
+  function relateItems(a: MemoryClusterItem, b: MemoryClusterItem): number {
+    const va = a?.vector || (vecOfRef && vecOfRef.get(String(a?.id)));
+    const vb = b?.vector || (vecOfRef && vecOfRef.get(String(b?.id)));
+    if (va && vb) {
+      const c = cosine(va, vb);
+      if (c !== null) return c;
+    }
+    return cheapSimilarity(a, b);
+  }
+
+  /**
+   * 一轮规划：聚类 → 切批 → 漏斗 → 增量复审 → 查缓存挑批。
    * @returns {{total,clusters,queue,batches,picked,cached,funnel,skippedSingles,skippedQuiet}}
    */
-  function plan({ all = [], vecOf = null, cache = {} }: { all?: MemoryClusterItem[]; vecOf?: VecLookup | null; cache?: Record<string, unknown> } = {}): PlanResult {
+  function plan({ all = [], vecOf = null, cache = {}, itemCache = {} }: { all?: MemoryClusterItem[]; vecOf?: VecLookup | null; cache?: Record<string, unknown>; itemCache?: ItemReviewCache } = {}): PlanResult {
+    vecOfRef = vecOf;
     const clusters = clusterOf!(all, vecOf) || [];
     const queue = clusters
       .filter((c) => c.length >= 2)
@@ -438,6 +473,11 @@ export function createBatchPlanner({
       l1VectorDropped: 0,
       l2DroppedBatches: 0,
       batchesOut: batches.length,
+      itemsIn: 0,
+      itemsOut: 0,
+      itemsSettled: 0,
+      itemShrunkBatches: 0,
+      itemSettledBatches: 0,
     };
 
     if (level >= 1) {
@@ -490,6 +530,42 @@ export function createBatchPlanner({
     }
 
     if (maxBatches > 0 && batches.length > maxBatches) batches = batches.slice(0, maxBatches);
+
+    // 增量复审（2026-11-23）：逐字未变、已审过的成员不再整批重送。
+    // 只动「送进模型的内容」，聚类/漏斗产物与 fp 之外的一切照旧；fp 在下面按送审成员重算。
+    {
+      const next: MemoryBatch[] = [];
+      for (const item of batches) {
+        const shrunk = shrinkClusterForReview(
+          item.cluster as unknown as ReviewItem[],
+          itemCache,
+          { relate: relateItems as unknown as (a: ReviewItem, b: ReviewItem) => number, neighborLimit: itemNeighborLimit },
+        );
+        funnel.itemsIn = (funnel.itemsIn || 0) + item.cluster.length;
+        funnel.itemsSettled = (funnel.itemsSettled || 0) + shrunk.skipped.length;
+        if (shrunk.cluster.length < 2) {
+          // 全批已审过（0 条）记 cached；凑不成一对（1 条）单独记 skipped，别混进缓存命中数
+          if (!shrunk.cluster.length) funnel.itemSettledBatches = (funnel.itemSettledBatches || 0) + 1;
+          else funnel.itemSkippedBatches = (funnel.itemSkippedBatches || 0) + 1;
+          continue;
+        }
+        funnel.itemsOut = (funnel.itemsOut || 0) + shrunk.cluster.length;
+        if (shrunk.cluster.length < item.cluster.length) {
+          funnel.itemShrunkBatches = (funnel.itemShrunkBatches || 0) + 1;
+          next.push({ ...item, cluster: shrunk.cluster as unknown as MemoryClusterItem[] });
+        } else {
+          next.push(item);
+        }
+      }
+      batches = next;
+      if (funnel.itemShrunkBatches || funnel.itemSettledBatches) {
+        log(
+          `[merge] 增量复审 条目 ${funnel.itemsIn}→${funnel.itemsOut}`
+          + `（已审过 ${funnel.itemsSettled} 条不再重送；收缩批 ${funnel.itemShrunkBatches}、整批已审过 ${funnel.itemSettledBatches}）`,
+        );
+      }
+    }
+
     if (packSize >= 2) {
       const before = batches.length;
       batches = packBatches(batches, {
@@ -505,7 +581,8 @@ export function createBatchPlanner({
     funnel.batchesOut = batches.length;
 
     const picked: MemoryBatch[] = [];
-    let cached = 0;
+    // 整批被条目缓存判「已审过」的批也算缓存命中：它们和批指纹命中一样，本轮不问模型。
+    let cached = funnel.itemSettledBatches || 0;
     for (const item of batches) {
       const fp = fingerprint!(item.cluster);
       if (cache[fp]) { cached += 1; continue; }

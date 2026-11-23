@@ -4,6 +4,10 @@
  */
 import { dueOps, markOp, MAX_ATTEMPTS } from '../ingest-index.js';
 import { merge as askMergeOps, validateOps } from '../agents/merge.js';
+import { cheapSimilarity, cosine } from '../batch-planner.js';
+import {
+  readItemReviewCache, shrinkClusterForReview, reviewAdditionsFromOps, mergeItemReviewCache, persistItemReviewCache,
+} from '../item-review-cache.js';
 import { llmOf } from '../llm-service.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { DueOp } from '../ingest-index.js';
@@ -18,7 +22,11 @@ interface ReplayEnv {
   ctx: SleepCtx;
   store: SleepStore;
   cfg: SleepCfg;
-  stateStore: { load: () => { organizeCache?: Record<string, unknown> } };
+  stateStore: {
+    load: () => { organizeCache?: Record<string, unknown> };
+    /** 条目级复审缓存写回用；老桩没有 patch 就跳过写回（行为与改前一致）。 */
+    patch?: (next: Record<string, unknown>) => unknown;
+  };
   log: (line: string) => void;
   ledger: {
     pendingDb: () => DatabaseSync | null;
@@ -94,6 +102,10 @@ async function replayMergeBatchSegment(deps: ReplayDeps): Promise<void> {
     // 已被整理段判成 noop（批里没活）或 acted（活已经落过），再问一遍模型只会得到同样的空；
     // 这类账直接收口 done，不调用模型、不耗 attempts，也不再每轮白烧一次调用。
     const replayCache: Record<string, { v?: unknown }> = stateStore.load().organizeCache as Record<string, { v?: unknown }> || {};
+    // 条目级复审结论段内累积，段尾一次写回（别每批 patch 一次 state 文件）
+    const canPersistItems = typeof stateStore.patch === 'function';
+    let itemCacheRound = canPersistItems ? readItemReviewCache(stateStore as never) : {};
+    let itemDirty = false;
     const singleBatch = deps.onlyOps?.find((o) => o.kind === 'merge_batch');
     for (const op of (singleBatch ? [singleBatch] : dueAll('merge_batch'))) {
       heartbeat();
@@ -111,12 +123,31 @@ async function replayMergeBatchSegment(deps: ReplayDeps): Promise<void> {
         // 失败只累加 attempts + last_error，下一轮照原样再试，不自动放弃、也不静默吞。
         const active = activeNow();
         const byId = new Map(active.map((m) => [String(m.id), m]));
-        const cluster = ids.map((id) => byId.get(id)).filter(Boolean) as unknown as MemoryView[];
+        let cluster = ids.map((id) => byId.get(id)).filter(Boolean) as unknown as MemoryView[];
         if (cluster.length < 2) {
           // 成员被并掉 / 归档了：这条账已经没活可干，终态 done，别每轮重试
           finish('merge_batch', op, 'done', 'stale_members');
           continue;
         }
+        // 增量复审（2026-11-23）：账本里的成员逐字没变、已审过的，不再整批重问——
+        // 只送变化项 + 最相关的旧邻居；全批都已审过就当场收口 done，不耗 attempts。
+        const itemCache = itemCacheRound;
+        const snapNow = deps.snapshot();
+        const relate = (a: { id?: unknown; text?: unknown; vector?: unknown }, b: { id?: unknown; text?: unknown; vector?: unknown }): number => {
+          const va = (a?.vector || (snapNow.vecOf && snapNow.vecOf.get(String(a?.id)))) as ArrayLike<number> | undefined;
+          const vb = (b?.vector || (snapNow.vecOf && snapNow.vecOf.get(String(b?.id)))) as ArrayLike<number> | undefined;
+          if (va && vb) {
+            const c = cosine(va, vb);
+            if (c !== null) return c;
+          }
+          return cheapSimilarity(a as never, b as never);
+        };
+        const shrunk = shrinkClusterForReview(cluster as unknown as [], itemCache, { relate: relate as never });
+        if (shrunk.cluster.length < 2) {
+          finish('merge_batch', op, 'done', 'item_settled');
+          continue;
+        }
+        cluster = shrunk.cluster as unknown as MemoryView[];
         const candidates = candidateListFor(cluster, active);
         let answer;
         let summary = '';
@@ -176,12 +207,25 @@ async function replayMergeBatchSegment(deps: ReplayDeps): Promise<void> {
         });
         const acted = applied.merged.length + applied.updated.length + applied.archived.length +
           applied.added.length + applied.split.length;
+        // 条目级结论记进本轮累积表：段尾一次写回，下一轮同内容的条目不再重问
+        if (canPersistItems) {
+          itemCacheRound = mergeItemReviewCache(
+            itemCacheRound,
+            reviewAdditionsFromOps(cluster as unknown as [], checked.valid, {
+              rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+            }),
+          );
+          itemDirty = true;
+        }
         finish('merge_batch', op, acted ? 'done' : 'pending', acted ? null : 'replay_noop');
       } catch (error) {
         // 单批异常不许把整段拖停：以前抛出去以后剩下的账留在 running，attempts 原地不动，
         // 下一轮租约回收又原样捡起来重跑——那才是真的不收敛。这里按一次失败记上，剩下的照跑。
         finish('merge_batch', op, 'pending', `replay_error ${shortErr(error)}`.slice(0, 500));
       }
+    }
+    if (canPersistItems && itemDirty) {
+      persistItemReviewCache(stateStore as never, itemCacheRound, { cfg: cfg as never, log: (line) => log(cfg, line) });
     }
   } catch (error) {
     log(cfg, `[replay] WARN merge_batch 段失败：${shortErr(error)}`);

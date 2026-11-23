@@ -7,6 +7,9 @@ import { merge as askMergeOps, validateOps } from '../agents/merge.js';
 import { llmOf, isLlmUnavailable } from '../llm-service.js';
 import { selectIngestConcurrency, formatIngestAdaptiveLog } from '../concurrency.js';
 import { CLUSTER_PROMPT_SHELL_TOKENS } from './batching.js';
+import {
+  readItemReviewCache, persistItemReviewCache, mergeItemReviewCache, reviewAdditionsFromOps,
+} from '../item-review-cache.js';
 import type { DatabaseSync } from 'node:sqlite';
 import type { MemoryView, SnapshotView } from '../store/types.js';
 import type { BatchPlanner } from '../batch-planner.js';
@@ -118,8 +121,10 @@ async function organizePassAgent({ dryRun = false } = {}) {
   const batchBudget = promptWindow ? Math.max(0, promptTokens - CLUSTER_PROMPT_SHELL_TOKENS) : 0;
   const stateBefore = stateStore.load();
   const cache = { ...(stateBefore.organizeCache || {}) };
-  // 与 organizePass / planPoolQueues 共用同一份「聚类→切批→漏斗→挑批」。
-  const plan = batchPlannerOf(batchBudget).plan({ all, vecOf, cache }) as unknown as { total: number; clusters: unknown[]; queue: unknown[]; batches: unknown[]; picked: Array<{ cluster: MemoryView[]; fp: string }>; cached: number; funnel: unknown; skippedSingles: number; skippedQuiet: number };
+  // 条目级复审缓存（2026-11-23）：语义同 legacy 路径——送审前摘掉逐字未变的已审成员。
+  let itemNext = readItemReviewCache(stateStore);
+  // 与 organizePass / planPoolQueues 共用同一份「聚类→切批→漏斗→增量复审→挑批」。
+  const plan = batchPlannerOf(batchBudget).plan({ all, vecOf, cache, itemCache: itemNext }) as unknown as { total: number; clusters: unknown[]; queue: unknown[]; batches: unknown[]; picked: Array<{ cluster: MemoryView[]; fp: string }>; cached: number; funnel: unknown; skippedSingles: number; skippedQuiet: number };
   const { clusters, queue, batches, picked } = plan;
   const out: AgentOrganizeOut = {
     agent: true,
@@ -278,7 +283,11 @@ async function organizePassAgent({ dryRun = false } = {}) {
       // 明确空动作 = 这批看过了、不用动：有效结论（2026-11-06 t-fix-quality）。
       // 按 noop 写进 organizeCache，下一轮同指纹直接命中，不再进 pending 烧钱。
       out.noop += 1;
-      if (!dryRun) cache[fp] = { v: 'noop', t: Date.now() };
+      if (!dryRun) {
+        cache[fp] = { v: 'noop', t: Date.now() };
+        // 条目级也记：这批每条都「看过、不用动」，下一轮同内容不再重送。
+        itemNext = mergeItemReviewCache(itemNext, reviewAdditionsFromOps(cluster, []));
+      }
       log(cfg, `[merge] 第${out.calls}批明确空 ops（${cluster.length}条 fp=${fp}）：记 noop 缓存，不入队`);
       continue;
     }
@@ -315,6 +324,13 @@ async function organizePassAgent({ dryRun = false } = {}) {
     out.added.push(...applied.added);
     out.rejected.push(...applied.rejected);
     out.split.push(...applied.split);
+    // 条目级结论：模型看过的每一条都记（acted 或「看过不用动」= noop）；
+    // 被写入闸/证据校验打回的 id 不记，下一轮同内容还要再问一遍。
+    if (!dryRun) {
+      itemNext = mergeItemReviewCache(itemNext, reviewAdditionsFromOps(cluster, checked.valid, {
+        rejected: applied.rejected as { ids?: unknown; id?: unknown }[],
+      }));
+    }
     const acted = applied.merged.length + applied.updated.length + applied.archived.length +
       applied.added.length + applied.split.length > 0;
     if (!dryRun && acted) {
@@ -356,6 +372,7 @@ async function organizePassAgent({ dryRun = false } = {}) {
 
   if (!dryRun && out.calls > 0) {
     persistOrganizeCache(cache as Record<string, CacheValue>);
+    persistItemReviewCache(stateStore, itemNext, { cfg: cfg as never, log: (line) => log(cfg, line) });
   }
 
   // 收尾第一步：重放三种 agent 账本（merge_batch → merge_op → dedupe_check）。

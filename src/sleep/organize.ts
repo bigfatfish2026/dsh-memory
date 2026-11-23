@@ -5,6 +5,9 @@ import { parseActions } from '../transcript.js';
 import { clusterForSleep } from '../cluster.js';
 import { clusterBySimilarGraph } from '../similar-graph.js';
 import { trimOrganizeCache, archiveDirOf } from '../organize-cache.js';
+import {
+  readItemReviewCache, persistItemReviewCache, mergeItemReviewCache, reviewAdditionsFromActions,
+} from '../item-review-cache.js';
 import { llmOf, isLlmUnavailable } from '../llm-service.js';
 import { CLUSTER_PROMPT_SHELL_TOKENS } from './batching.js';
 import { log } from './log.js';
@@ -141,8 +144,11 @@ async function organizePass({ dryRun = false }: { dryRun?: boolean } = {}): Prom
   const batchBudget = promptWindow ? Math.max(0, promptTokens - CLUSTER_PROMPT_SHELL_TOKENS) : 0;
   const stateBefore: SleepState = stateStore.load();
   const cache: Record<string, CacheValue> = { ...(stateBefore.organizeCache as Record<string, CacheValue> || {}) };
-  // 聚类 → 切批 → L0-L3 漏斗 → 查缓存挑批，全在 BatchPlanner（三处共用一份）。
-  const plan = batchPlannerOf(batchBudget).plan({ all, vecOf, cache });
+  // 条目级复审缓存（2026-11-23）：只按条目内容哈希命中，成员数组变化不影响。
+  // 送给 plan 的是「已审过的关系」，plan 会把逐字未变的成员摘掉，只留变化项 + 旧邻居。
+  let itemNext = readItemReviewCache(stateStore);
+  // 聚类 → 切批 → L0-L3 漏斗 → 增量复审 → 查缓存挑批，全在 BatchPlanner（三处共用一份）。
+  const plan = batchPlannerOf(batchBudget).plan({ all, vecOf, cache, itemCache: itemNext });
   const { clusters, queue, batches, picked } = plan;
   const out: OrganizeResult = {
     total: plan.total,
@@ -232,6 +238,11 @@ async function organizePass({ dryRun = false }: { dryRun?: boolean } = {}): Prom
       out.rejected.push(...r.rejected);
       const acted = r.merged.length + r.updated.length + r.archived.length > 0;
       cache[fp as string] = { v: acted ? 'acted' : 'noop', t: Date.now() };
+      // 条目级结论：模型看过的每一条都记（acted 或「看过不用动」= noop）；
+      // 被 applyActions 打回的 id 一条都不记，下一轮还得重问。
+      if (!dryRun) {
+        itemNext = mergeItemReviewCache(itemNext, reviewAdditionsFromActions(cluster, actions as never, { rejected: r.rejected as never[] }));
+      }
       if (acted) {
         log(
           cfg,
@@ -245,6 +256,7 @@ async function organizePass({ dryRun = false }: { dryRun?: boolean } = {}): Prom
   }
   if (!dryRun && out.calls > 0) {
     persistOrganizeCache(cache);
+    persistItemReviewCache(stateStore, itemNext, { cfg: cfg as never, log: (line) => log(cfg, line) });
   }
   log(
     cfg,

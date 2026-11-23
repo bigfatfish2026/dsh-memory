@@ -20,6 +20,7 @@ import {
 import type { LoadSnapshot, ConcurrencyConfig, ConcurrencyPick } from '../concurrency.js';
 import type { SleepCfg, SleepCtx } from './env.js';
 import type { SleepState, SleepStateStore } from '../sleep-state.js';
+import type { ItemReviewCache } from '../item-review-cache.js';
 
 /** 调度器用到的 env 面（装配完才有 passes）。 */
 export interface SchedulerEnv {
@@ -76,6 +77,9 @@ export class SlotScheduler {
   /** 本轮 merge 结论缓存：批指纹 -> {v:'acted'|'noop', t}。收尾并进 organizeCache。 */
   #mergeBatchCache: Record<string, MergeVerdict> = {};
 
+  /** 本轮条目级复审结论：条目键 -> {v,rel,t}。收尾并进 state 的 itemReviewCache。 */
+  #itemReviewCache: ItemReviewCache = {};
+
   /** 阶段自适应日志每轮只打一次。 */
   #stageLogged = new Set<string>();
 
@@ -98,6 +102,7 @@ export class SlotScheduler {
     this.#roundSnapshot = null;
     this.#stageLogged.clear();
     this.#mergeBatchCache = {};
+    this.#itemReviewCache = {};
     this.#inFlight = false;
   }
 
@@ -124,6 +129,17 @@ export class SlotScheduler {
   putMergeResult(label: string, value: MergeVerdict): MergeVerdict {
     this.#mergeBatchCache[label] = value;
     return value;
+  }
+
+  /** 本轮条目级复审结论（整体视图；pool 收尾并进 state 的 itemReviewCache）。 */
+  itemReviewCache(): ItemReviewCache {
+    return this.#itemReviewCache;
+  }
+
+  /** 并入一批条目级结论（同键覆盖，后到的 t 更新）。 */
+  putItemReview(additions: ItemReviewCache): ItemReviewCache {
+    this.#itemReviewCache = { ...this.#itemReviewCache, ...(additions || {}) };
+    return this.#itemReviewCache;
   }
 
   /** 某段的并发口径：cap 走统一口径，快照用本轮的；独立调用时没有轮级快照就现取一次。 */

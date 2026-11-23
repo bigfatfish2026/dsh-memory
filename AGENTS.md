@@ -48,6 +48,26 @@ README 讲功能，这文件讲「动手改的时候照哪里做」。
 - ingest 队列同一口径：`src/ingest-index.ts` 的 attempts 到 5 标 dead，
   `last_error` 只给人看，不参与判死。
 
+## 增量复审：整批指纹之外还有一层条目级缓存
+
+2026-11-23（t-mwsvibwz-f9ve）：一笔 962 条的合并吃了 11.6 万未缓存输入 + 3.1 万输出，
+其中 873 条与早上那批逐字相同，只因 `batchFingerprint()` 把成员数组算进键，成员一变整批失效。
+现在送审前多一层 `src/item-review-cache.ts`：
+
+- 键 = 条目 id + 正文原始字节 sha1（`itemReviewKey`）。**正文变了才失效**；
+  成员数组变化不碰键，老条目继续命中。别把 type/entities/ts 拼进键——那些不决定合并结论。
+- 送审内容 = 变化项（新增/改写）+ 它们最相关的旧邻居（默认 8 条，`DEFAULT_ITEM_REVIEW_NEIGHBORS`；
+  962 那笔实测：89 个变化项带出 8 条不同旧邻居，送审 962→97）。全批都已审过 → 一条不送；全批首见 → 整批原样送。
+- 缓存落在 `sleep.state.json` 顶层 `itemReviewCache`（跟 `organizeCache` / `splitVerdictCache`
+  一套 `stateStore` 机制），轮转复用 `trimOrganizeCache`（按 t 留最近 2000 条）。
+- 只记有效结论：acted 或明确 noop；被证据校验/写入闸打回的 id 不记，下一轮还得重问。
+- 日志固定两行，排查先 grep 它们：
+  - planner：`[merge] 增量复审 条目 <N>→<M>（已审过 <K> 条不再重送；收缩批 <a>、整批已审过 <b>）`
+  - pool 收尾：`[item-review] 条目缓存 本轮新增 <n> 条，主文件留 <m> 条`
+- 回放核对（只读、不写库）：`node scripts/replay-item-review-962.mjs --db <库>`，
+  加 `--ask` 才真跑模型比结论；不加只打「旧口径送 N / 新口径送 M / 复用 K」的对照表。
+
+
 ## 单条失败隔离
 
 - 写库循环里逐条 try/catch：一条坏了只标这一条 `failOne`，别让一条脏数据把整批回滚。

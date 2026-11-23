@@ -35,6 +35,12 @@ export interface SleepState {
    * 值 {reason,t}。读写与上限淘汰都在 src/split-verdict-cache.ts。
    */
   splitVerdictCache?: Record<string, unknown>;
+  /**
+   * 条目级复审缓存（2026-11-23，t-mwsvibwz-f9ve）：键 = 条目 id + 正文 sha1，
+   * 值 {v:'acted'|'noop', rel:[[对方id,关系]], t}。读写与轮转在 src/item-review-cache.ts。
+   * 只记已审过的关系；正文一变键就变（失效），成员数组变化不影响命中。
+   */
+  itemReviewCache?: Record<string, unknown>;
   [key: string]: unknown;
 }
 
@@ -59,7 +65,7 @@ function asSleepState(raw: unknown): SleepState | null {
     || (v !== null && typeof v === 'object' && !Array.isArray(v));
   if (!numOrMissing(s.lastSleepAt) || !strOrMissing(s.lastSleepDay)) return null;
   if (!strOrMissing(s.owner) || !numOrMissing(s.runningAt) || !numOrMissing(s.heartbeatAt)) return null;
-  for (const key of ['slots', 'owedSlots', 'organizeCache', 'splitVerdictCache']) {
+  for (const key of ['slots', 'owedSlots', 'organizeCache', 'splitVerdictCache', 'itemReviewCache']) {
     if (!objOrMissing(s[key])) return null;
   }
   return s as SleepState;
