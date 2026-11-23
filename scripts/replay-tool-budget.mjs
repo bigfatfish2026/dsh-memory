@@ -37,7 +37,7 @@ const DEFAULT_MODEL = process.env.DSH_REHEARSE_MODEL || 'group/ds';
 function usage() {
   return `用法：
   node scripts/replay-tool-budget.mjs --estimate [--log <日志>] [--since <ISO>] [--until <ISO>] [--cap 4000] [--json]
-  node scripts/replay-tool-budget.mjs --replay --sessions <目录> --db <副本/memory.db> [--limit 3] [--since <ISO>] [--out <json>] [--json]
+  node scripts/replay-tool-budget.mjs --replay --sessions <目录> --db <副本/memory.db> [--limit 3] [--since <ISO>] [--baseline-repeats 2] [--out <json>] [--json]
 
   --estimate  离线估算（默认；不调模型）
   --replay    真回放 A/B（调真模型；--db 必须是副本库）
@@ -45,6 +45,7 @@ function usage() {
   --sessions  会话目录，默认 $DSH_SESSIONS_DIR 或 ~/.dsh/sessions
   --db        副本库（文件名一般就是 memory.db）
   --limit     回放几个文件（默认 3，按 mtime 从近到远）
+  --baseline-repeats  基线跑几遍（默认 1；给 2 时多跑一遍基线，用两遍基线的差异当模型非确定性噪音）
   --since     只统计/回放这个时刻之后（ISO，日志是 UTC）
   --until     只统计到这个时刻之前（ISO，估算模式）
   --cap       累计工具片段上限（token，默认 4000）
@@ -57,7 +58,7 @@ function usage() {
 function parseArgs(argv) {
   const out = {
     estimate: false, replay: false, log: '', sessions: '', db: '', limit: 3,
-    since: '', until: '', cap: CAP_DEFAULT, out: '', json: false, help: false,
+    since: '', until: '', cap: CAP_DEFAULT, out: '', json: false, help: false, baselineRepeats: 1,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -81,6 +82,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--since=')) out.since = arg.slice(8);
     else if (arg === '--until') out.until = take();
     else if (arg.startsWith('--until=')) out.until = arg.slice(8);
+    else if (arg === '--baseline-repeats') out.baselineRepeats = Math.max(1, Number(take()) || 1);
+    else if (arg.startsWith('--baseline-repeats=')) out.baselineRepeats = Math.max(1, Number(arg.slice(19)) || 1);
     else if (arg === '--cap') out.cap = Math.max(0, Number(take()) || 0);
     else if (arg.startsWith('--cap=')) out.cap = Math.max(0, Number(arg.slice(6)) || 0);
     else if (arg === '--out') out.out = path.resolve(take());
@@ -208,6 +211,21 @@ function sameSignature(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/** 结构口径：动作桶数 + update/merge/archive 的 id 集合。add 正文措辞的差异不算「结论掉了」。 */
+function structureOf(sig) {
+  const ids = (list) => list.map((x) => String(x).split('::')[0]).sort();
+  return {
+    add: sig.add.length,
+    update: ids(sig.update),
+    merge: ids(sig.merge),
+    archive: sig.archive.slice().sort(),
+  };
+}
+
+function sameStructure(a, b) {
+  return JSON.stringify(structureOf(a)) === JSON.stringify(structureOf(b));
+}
+
 function countOf(sig) {
   return sig.add.length + sig.update.length + sig.merge.length + sig.archive.length;
 }
@@ -219,17 +237,18 @@ async function replayArm({ armName, files, cfg, ctxBase, budgetCfg, checkCfg }) 
     apiKey: process.env.DSH_REHEARSE_API_KEY || '',
   });
   const ctx = { ...ctxBase, get: (name) => (name === 'llm' ? llm : undefined) };
-  const envCore = createSleepEnv(ctx, ctx.store, cfg);
+  const logLines = [];
   const model = createModelCalls({
     ctx,
     store: ctx.store,
     cfg: { ...cfg, ...budgetCfg, ...checkCfg },
-    log: () => {},
+    log: (line) => logLines.push(String(line)),
     lint: {},
   });
   const rows = [];
   for (const item of files) {
     const before = { calls: llm.usage.calls, input: llm.usage.promptTokens, output: llm.usage.completionTokens, cacheRead: llm.usage.cacheReadTokens };
+    const logFrom = logLines.length;
     let raw = '';
     let error = '';
     try {
@@ -237,6 +256,7 @@ async function replayArm({ armName, files, cfg, ctxBase, budgetCfg, checkCfg }) 
     } catch (e) {
       error = String(e?.message || e);
     }
+    const mine = logLines.slice(logFrom);
     rows.push({
       file: path.basename(item.file),
       arm: armName,
@@ -244,6 +264,9 @@ async function replayArm({ armName, files, cfg, ctxBase, budgetCfg, checkCfg }) 
       input: llm.usage.promptTokens - before.input,
       output: llm.usage.completionTokens - before.output,
       cacheRead: llm.usage.cacheReadTokens - before.cacheRead,
+      toolCalls: mine.filter((line) => line.startsWith('整理时核对')).length,
+      compactions: mine.filter((line) => line.includes('[sleep] 工具上下文预算 轮=')).length,
+      guardStops: mine.filter((line) => line.includes('[agent-loop] 中断')).length,
       error,
       signature: actionSignature(raw),
     });
@@ -251,7 +274,7 @@ async function replayArm({ armName, files, cfg, ctxBase, budgetCfg, checkCfg }) 
   return rows;
 }
 
-async function replay({ sessions, db, limit, since }) {
+async function replay({ sessions, db, limit, since, baselineRepeats = 1 }) {
   if (!sessions) throw new Error('--replay 必须给 --sessions');
   if (!db) throw new Error('--replay 必须给 --db（副本库）');
   if (path.resolve(db) === path.resolve(DEFAULT_DB_PATH)) {
@@ -298,11 +321,15 @@ async function replay({ sessions, db, limit, since }) {
   if (!picked.length) throw new Error('选中的会话文件都没有可回放的消息');
 
   const ctxBase = { store, logger: cfg.logger, provide() {}, effect() {}, tools: { get: () => null, register() {} } };
-  const baseline = await replayArm({
-    armName: 'baseline', files: picked, cfg, ctxBase,
-    budgetCfg: { sleepToolBudget: { enabled: false }, sleepToolCheck: { enabled: false } },
-    checkCfg: {},
-  });
+  // 基线跑多遍：模型自己就有非确定性，两遍基线的差异 = 噪音水位，用来判断预算臂的差异算不算「掉了」
+  const baselines = [];
+  for (let i = 0; i < Math.max(1, baselineRepeats); i += 1) {
+    baselines.push(await replayArm({
+      armName: i === 0 ? 'baseline' : `baseline${i + 1}`, files: picked, cfg, ctxBase,
+      budgetCfg: { sleepToolBudget: { enabled: false }, sleepToolCheck: { enabled: false } },
+      checkCfg: {},
+    }));
+  }
   const budgeted = await replayArm({
     armName: 'budget', files: picked, cfg, ctxBase,
     budgetCfg: {}, // 默认配置：预算开、定向查证开
@@ -310,13 +337,20 @@ async function replay({ sessions, db, limit, since }) {
   });
 
   const rows = picked.map((item, index) => {
-    const b = baseline[index];
+    const b = baselines[0][index];
     const n = budgeted[index];
+    const b2 = baselines[1] ? baselines[1][index] : null;
     return {
       file: b.file,
       baseline: { calls: b.calls, input: b.input, output: b.output, cacheRead: b.cacheRead, actions: countOf(b.signature), signature: b.signature },
       budget: { calls: n.calls, input: n.input, output: n.output, cacheRead: n.cacheRead, actions: countOf(n.signature), signature: n.signature },
-      sameConclusion: sameSignature(b.signature, n.signature),
+      ...(b2 ? {
+        baseline2: { calls: b2.calls, input: b2.input, output: b2.output, cacheRead: b2.cacheRead, actions: countOf(b2.signature), signature: b2.signature },
+        sameConclusionBaseline2: sameStructure(b.signature, b2.signature),
+        sameTextsBaseline2: sameSignature(b.signature, b2.signature),
+      } : {}),
+      sameConclusion: sameStructure(b.signature, n.signature),
+      sameTexts: sameSignature(b.signature, n.signature),
       error: b.error || n.error,
     };
   });
@@ -328,13 +362,18 @@ async function replay({ sessions, db, limit, since }) {
     files: rows.length,
     totals: {
       baseline: { calls: sum('baseline', 'calls'), input: sum('baseline', 'input'), output: sum('baseline', 'output'), cacheRead: sum('baseline', 'cacheRead'), actions: sum('baseline', 'actions') },
+      ...(rows[0] && rows[0].baseline2 ? { baseline2: { calls: sum('baseline2', 'calls'), input: sum('baseline2', 'input'), output: sum('baseline2', 'output'), cacheRead: sum('baseline2', 'cacheRead'), actions: sum('baseline2', 'actions') } } : {}),
       budget: { calls: sum('budget', 'calls'), input: sum('budget', 'input'), output: sum('budget', 'output'), cacheRead: sum('budget', 'cacheRead'), actions: sum('budget', 'actions') },
     },
     sameConclusion: rows.filter((r) => r.sameConclusion).length,
+    sameTexts: rows.filter((r) => r.sameTexts).length,
+    sameConclusionBaseline2: rows.filter((r) => r.sameConclusionBaseline2).length,
+    sameTextsBaseline2: rows.filter((r) => r.sameTextsBaseline2).length,
     rows,
     notes: [
       '两个 arm 都是独立进程内的独立 llm 实例，输入/输出是按 [usage] 字段累计的真值。',
-      '温度固定 0.3 仍有非确定性：结论差异按同一文件配对看，不能跨文件比。',
+      '温度固定 0.3 仍有非确定性：结论差异按同一文件配对看，不能跨文件比；--baseline-repeats 2 给出噪音水位。',
+      '结构口径 = add 条数 + update/merge/archive 的 id 集合；正文逐字比较只作参考。',
       '缓存读取取决于上游前缀缓存命中，回放数值与线上不同；费用要上线后另测。',
     ],
   };
@@ -359,7 +398,7 @@ async function main() {
     for (const line of report.assumptions) console.log(`  - ${line}`);
     return 0;
   }
-  const report = await replay({ sessions: args.sessions || resolveSessionsRoot(), db: args.db || resolveDbPath(), limit: args.limit, since: args.since });
+  const report = await replay({ sessions: args.sessions || resolveSessionsRoot(), db: args.db || resolveDbPath(), limit: args.limit, since: args.since, baselineRepeats: args.baselineRepeats });
   if (args.out) fs.writeFileSync(args.out, JSON.stringify(report, null, 2));
   if (args.json) {
     console.log(JSON.stringify(report, null, 2));
@@ -367,11 +406,15 @@ async function main() {
   }
   console.log(`真回放：${report.files} 个文件（${report.sessions}）`);
   console.log('arm        calls   未缓存输入   缓存读取   输出   动作数');
-  for (const arm of ['baseline', 'budget']) {
+  for (const arm of ['baseline', 'baseline2', 'budget'].filter((a) => report.totals[a])) {
     const t = report.totals[arm];
     console.log(`${arm.padEnd(10)} ${String(t.calls).padStart(5)} ${String(t.input).padStart(12)} ${String(t.cacheRead).padStart(10)} ${String(t.output).padStart(8)} ${String(t.actions).padStart(7)}`);
   }
-  console.log(`结论一致：${report.sameConclusion}/${report.files}`);
+  console.log(`结论一致（结构口径：桶数 + update/merge/archive id）：${report.sameConclusion}/${report.files}`);
+  console.log(`结论一致（正文逐字口径，仅参考）：${report.sameTexts}/${report.files}`);
+  if (report.totals.baseline2) {
+    console.log(`噪音水位（baseline vs baseline2，结构 / 正文）：${report.sameConclusionBaseline2}/${report.files} / ${report.sameTextsBaseline2}/${report.files}`);
+  }
   for (const line of report.notes) console.log(`  - ${line}`);
   return 0;
 }
