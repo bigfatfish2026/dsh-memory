@@ -129,6 +129,14 @@ export interface SplitConsumeOpts {
    */
   skipOpIds?: Array<string | number>;
   /**
+   * 不在这里打 `[split] verdict-cache` 那一行（2026-11-24）。
+   *
+   * 只给 `consumeSplitOpsWithRecheck` 用：它一趟里会调本函数两三次，各自打一行
+   * 会让人把补扫那趟的 `hit=0` 误读成「缓存没命中」。合并后的 total 由它在收尾
+   * 统一打一行。
+   */
+  verdictCacheQuiet?: boolean;
+  /**
    * 「不可拆」判定缓存（2026-11-22）：跨轮存在 sleep.state.json 的 splitVerdictCache 字段。
    * 不传就不启用（其它调用点/测试行为不变）；pool-pass 传真实的 stateStore 包装。
    */
@@ -508,6 +516,29 @@ export function splitBreakdownOf(stats: SplitStats): SplitStatsBreakdown {
 }
 
 /**
+ * 一行判定缓存统计（2026-11-24 从 consumeSplitOps 里抽出来）。
+ *
+ * 抽出来是为了让「一轮只打一行」成为可能：合并后的 total 由
+ * `consumeSplitOpsWithRecheck` 在收尾处用它打，单独调 `consumeSplitOps` 的
+ * 调用方仍得到一模一样的文案。
+ *
+ * @param stats 这一轮（或这一趟）的累计统计
+ * @param size 缓存落盘后的条数（dryRun 时是内存里的条数）
+ * @param cache 缓存实例，取 added / max / ruleVersion
+ */
+export function verdictCacheLine(
+  stats: Pick<SplitStats, 'cacheHits' | 'autoObservationSkipped'>,
+  size: number,
+  cache: Pick<SplitVerdictCache, 'added' | 'max' | 'ruleVersion'>,
+): string {
+  return (
+    `[split] verdict-cache hit=${stats.cacheHits} saved_llm=${stats.cacheHits} ` +
+    `added=${cache.added()} size=${size} max=${cache.max} ` +
+    `rules=${cache.ruleVersion} 自动观察跳过=${stats.autoObservationSkipped}`
+  );
+}
+
+/**
  * 分类合计（2026-11-22）：unavoidable 在 :764-765 已经加进 pendingAfter，这里再加一次
  * 就是双计——实测那轮 493 条被算成 740，「差多少条未落账」的差值方向就跟着反了。
  * 口径：不可拆包含在回队里，不单列。
@@ -694,6 +725,7 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
     concurrency = 1,
     writeLock = null,
     verdictCache = null,
+    verdictCacheQuiet = false,
   } = opts;
   const stats: SplitStats = {
     scanned: 0, tried: 0, unavailable: 0, unavoidable: 0, archived: 0,
@@ -1265,16 +1297,19 @@ export async function consumeSplitOps(opts: SplitConsumeOpts = {}): Promise<Spli
     log?.(`[split] 预检不可拆 合计 n=${stats.precheckSkipped} saved_llm=${stats.precheckSkipped}`);
   }
 
-  // 判定缓存统计（2026-11-22）：接了缓存就每轮打一行，命中 0 也打。
+  // 判定缓存统计（2026-11-22，2026-11-24 挪位）：接了缓存就每轮写回一次，
   // 「不能静默全不命中」靠这行的 size / rules：字段被升级读丢时 size=0，
   // SPLIT_RULES 文本改过时 rules 串变，一眼能看出来。dryRun 不写 state。
+  //
+  // 谁负责打印：`consumeSplitOpsWithRecheck` 收尾打一行合并后的 total
+  // （2026-11-24）。这里只在没人合并的时候自己打——`quiet` 就是那个开关。
+  // 老的样子是每次调用各打一行，于是轮末补扫那一趟必然打出 hit=0（队列已被
+  // 首趟领空），两行并排看着像「缓存没命中」，误导人。
   if (verdictCache) {
     const size = dryRun ? verdictCache.size() : verdictCache.flush();
-    log?.(
-      `[split] verdict-cache hit=${stats.cacheHits} saved_llm=${stats.cacheHits} ` +
-        `added=${verdictCache.added()} size=${size} max=${verdictCache.max} ` +
-        `rules=${verdictCache.ruleVersion} 自动观察跳过=${stats.autoObservationSkipped}`,
-    );
+    if (!verdictCacheQuiet) {
+      log?.(verdictCacheLine(stats, size, verdictCache));
+    }
   }
   return stats;
 }
@@ -1328,8 +1363,15 @@ export async function consumeSplitOpsWithRecheck({
 }: SplitRecheckOpts = {}): Promise<SplitStats> {
   // 一份集合贯穿所有 pass：consumeSplitOps 往里 push，下一次调用拿它当 exclude。
   const skipOpIds: Array<string | number> = Array.isArray(opts.skipOpIds) ? opts.skipOpIds : [];
-  const total = await consumeSplitOps({ ...opts, skipOpIds });
-  if (typeof awaitProducers !== 'function') return total;
+  // 判定缓存那一行由这里统一打（2026-11-24）：里面每一趟都不打，否则补扫那趟
+  // 必然给出 hit=0，和首趟并排看着像「缓存没命中」。没有 awaitProducers 时只有
+  // 一趟，照样由下面统一打，调用方拿到的文案与以前逐字一致。
+  const quietOpts = { ...opts, skipOpIds, verdictCacheQuiet: true };
+  const total = await consumeSplitOps(quietOpts);
+  if (typeof awaitProducers !== 'function') {
+    logVerdictCacheOnce(opts, total);
+    return total;
+  }
   const cap = Math.min(Math.max(Math.floor(Number(maxPasses) || 1), 1), 10);
   const waitMs = Math.max(20, Math.floor(Number(producerTimeoutMs) || PRODUCER_WAIT_TIMEOUT_MS));
   for (let pass = 1; pass < cap; pass += 1) {
@@ -1344,12 +1386,27 @@ export async function consumeSplitOpsWithRecheck({
       opts.log?.(`[split] WARN 等生产者收工失败，按当前队列收尾：${String((error as Error && (error as Error).message) || error as string).slice(0, 120)}`);
       break;
     }
-    const again = await consumeSplitOps({ ...opts, skipOpIds });
+    const again = await consumeSplitOps(quietOpts);
     mergeSplitStats(total, again);
     if (!again.scanned) break;
     opts.log?.(`[split] 轮末补扫第 ${pass} 轮：条 ${again.scanned} 落库 ${again.succeeded} 回队 ${again.pendingAfter}`);
   }
+  logVerdictCacheOnce(opts, total);
   return total;
+}
+
+/**
+ * 一轮结束打一行判定缓存统计（2026-11-24）。
+ *
+ * 用合并后的 total，所以 `hit=` 是首趟 + 所有补扫加起来的数，不再出现「补扫那条
+ * hit=0」把读者带偏。没有缓存就什么都不打（与以前一致）。
+ */
+function logVerdictCacheOnce(opts: SplitConsumeOpts, total: SplitStats): void {
+  const cache = opts.verdictCache;
+  if (!cache) return;
+  // 里面每一趟已经 flush 过，这里读的就是落盘后的条数（dryRun 时是内存条数）。
+  const size = cache.size();
+  opts.log?.(verdictCacheLine(total, size, cache));
 }
 
 export default consumeSplitOps;

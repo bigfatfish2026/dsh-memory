@@ -276,3 +276,51 @@ test('自动观察不进普通拆分（split-pass 入口）：不放进 targets�
   assert.ok(!preview.includes(obsText), '预览里没有自动观察正文');
   assert.ok(preview.includes(twoSentenceText('网线')), '预览里有手工观察的正文');
 });
+
+test('一轮只打一行 verdict-cache：补扫那趟不再另打 hit=0（2026-11-24）', async () => {
+  // 起因：consumeSplitOps 每次调用各打一行，consumeSplitOpsWithRecheck 一趟里会调两三
+  // 次，补扫时队列已被首趟领空，必然打出 hit=0——两行并排看着像「缓存没命中」。
+  // 现在由 consumeSplitOpsWithRecheck 收尾统一打一行合并后的 total。
+  const { dir, db } = tmpDb();
+  const textA = twoSentenceText('风扇');
+  const textB = twoSentenceText('机房');
+  const store = fakeStore([{ id: 'a', text: textA }, { id: 'b', text: textB }]);
+  const stateStore = createSleepState({ file: path.join(dir, 'sleep.state.json') });
+  const llm = fakeLlm({ unavoidableWords: ['风扇', '机房'] });
+
+  // 第一轮：两条都问模型、都判不可拆，把两条都写进缓存。
+  enqueue(db, 'split_item', 'a', { source_id: 'a', text: textA, type: 'world' });
+  enqueue(db, 'split_item', 'b', { source_id: 'b', text: textB, type: 'world' });
+  await consumeSplitOps({
+    db, store, llm, concurrency: 1, maxChars: 200, textLint: false, lintReview: false,
+    verdictCache: createSplitVerdictCache(stateStore), log: () => {},
+  });
+  assert.equal(llm.calls.length, 2, '第一轮两条都问了模型');
+
+  // 两条回队；把它们推到未来，再造两条新 op 走「首趟 1 条 + 补扫 1 条」。
+  db.prepare("UPDATE pending_ops SET next_try_at = ?").run(T0 + 999_999_999);
+  enqueue(db, 'split_item', 'a2', { source_id: 'a2', text: textA, type: 'world' });
+  const cache = createSplitVerdictCache(stateStore);
+  assert.equal(cache.size(), 2, '缓存跨轮存活，两条都在');
+
+  const logs = [];
+  let produced = 0;
+  const awaitProducers = async () => {
+    produced += 1;
+    if (produced === 1) enqueue(db, 'split_item', 'b2', { source_id: 'b2', text: textB, type: 'world' });
+  };
+  const { consumeSplitOpsWithRecheck } = await import('../lib/pipeline-split.js');
+  const stats = await consumeSplitOpsWithRecheck({
+    db, store, llm, limit: Infinity, maxChars: 200, textLint: false, lintReview: false,
+    awaitProducers, log: (line) => logs.push(line),
+    verdictCache: cache,
+  });
+
+  const cacheLines = logs.filter((line) => line.includes('[split] verdict-cache'));
+  assert.equal(cacheLines.length, 1, `一轮只打一行，实际 ${cacheLines.length} 行：\n${logs.join('\n')}`);
+  // 首趟 1 条 + 补扫 1 条，命中数是两趟之和 —— 不是补扫那一趟的 0。
+  assert.equal(stats.cacheHits, 2, '两趟各命中一条');
+  assert.match(cacheLines[0], /\[split\] verdict-cache hit=2 saved_llm=2 added=0 size=2 /);
+  assert.equal(llm.calls.length, 2, '两趟全部命中缓存，一条都没再问模型');
+  db.close();
+});

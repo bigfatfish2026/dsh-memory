@@ -37,7 +37,7 @@ const DEFAULT_MODEL = process.env.DSH_REHEARSE_MODEL || 'group/ds';
 function usage() {
   return `用法：
   node scripts/replay-tool-budget.mjs --estimate [--log <日志>] [--since <ISO>] [--until <ISO>] [--cap 4000] [--json]
-  node scripts/replay-tool-budget.mjs --replay --sessions <目录> --db <副本/memory.db> [--limit 3] [--since <ISO>] [--baseline-repeats 2] [--out <json>] [--json]
+  node scripts/replay-tool-budget.mjs --replay --sessions <目录> --db <副本/memory.db> [--limit 3] [--since <ISO>] [--baseline-repeats 2] [--concurrency 4] [--out <json>] [--json]
 
   --estimate  离线估算（默认；不调模型）
   --replay    真回放 A/B（调真模型；--db 必须是副本库）
@@ -46,6 +46,7 @@ function usage() {
   --db        副本库（文件名一般就是 memory.db）
   --limit     回放几个文件（默认 3，按 mtime 从近到远）
   --baseline-repeats  基线跑几遍（默认 1；给 2 时多跑一遍基线，用两遍基线的差异当模型非确定性噪音）
+  --concurrency  每个 arm 内部同时回放几个文件（默认 4；1 = 逐文件串行；arm 之间始终串行）
   --since     只统计/回放这个时刻之后（ISO，日志是 UTC）
   --until     只统计到这个时刻之前（ISO，估算模式）
   --cap       累计工具片段上限（token，默认 4000）
@@ -59,6 +60,7 @@ function parseArgs(argv) {
   const out = {
     estimate: false, replay: false, log: '', sessions: '', db: '', limit: 3,
     since: '', until: '', cap: CAP_DEFAULT, out: '', json: false, help: false, baselineRepeats: 1,
+    concurrency: 4,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -84,6 +86,8 @@ function parseArgs(argv) {
     else if (arg.startsWith('--until=')) out.until = arg.slice(8);
     else if (arg === '--baseline-repeats') out.baselineRepeats = Math.max(1, Number(take()) || 1);
     else if (arg.startsWith('--baseline-repeats=')) out.baselineRepeats = Math.max(1, Number(arg.slice(19)) || 1);
+    else if (arg === '--concurrency') out.concurrency = Math.max(1, Number(take()) || 1);
+    else if (arg.startsWith('--concurrency=')) out.concurrency = Math.max(1, Number(arg.slice(14)) || 1);
     else if (arg === '--cap') out.cap = Math.max(0, Number(take()) || 0);
     else if (arg.startsWith('--cap=')) out.cap = Math.max(0, Number(arg.slice(6)) || 0);
     else if (arg === '--out') out.out = path.resolve(take());
@@ -226,55 +230,103 @@ function sameStructure(a, b) {
   return JSON.stringify(structureOf(a)) === JSON.stringify(structureOf(b));
 }
 
+/** 固定 N 路的小并发池：结果按下标对位写回，完成顺序不打乱。
+ * 不用插件产物（src/concurrency.ts），脚本要能脱离构建独立跑。
+ * onDone(index) 给外部记账/打点用，每完成一个调一次。 */
+async function mapLimit(items, limit, fn, onDone = () => {}) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      out[index] = await fn(items[index], index);
+      onDone(index);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, worker));
+  return out;
+}
+
 function countOf(sig) {
   return sig.add.length + sig.update.length + sig.merge.length + sig.archive.length;
 }
 
-async function replayArm({ armName, files, cfg, ctxBase, budgetCfg, checkCfg }) {
-  const llm = createRehearseLlm({
+/**
+ * 某个文件这一次 askModel 的用量与动作，全部取「本请求自己」的累计。
+ *
+ * 2026-11-23：改并发后不能再按「跑前跑后差值」记账——同一个 llm 实例上有 N 个文件同时在打，
+ * 差值会把别人的请求算进来。所以 replayArm 给每个文件建独立的 llm（usage 只属于这一条），
+ * 这里拿到的是独享计数，不再做跨文件相减。
+ */
+function rowOfArm({ armName, item, llm, raw, error, mine }) {
+  return {
+    file: path.basename(item.file),
+    arm: armName,
+    calls: llm.usage.calls,
+    input: llm.usage.promptTokens,
+    output: llm.usage.completionTokens,
+    cacheRead: llm.usage.cacheReadTokens,
+    toolCalls: mine.filter((line) => line.startsWith('整理时核对')).length,
+    compactions: mine.filter((line) => line.includes('[sleep] 工具上下文预算 轮=')).length,
+    guardStops: mine.filter((line) => line.includes('[agent-loop] 中断')).length,
+    error,
+    signature: actionSignature(raw),
+  };
+}
+
+function makeLlm() {
+  return createRehearseLlm({
     baseUrl: process.env.DSH_REHEARSE_BASE_URL || DEFAULT_BASE_URL,
     model: process.env.DSH_REHEARSE_MODEL || DEFAULT_MODEL,
     apiKey: process.env.DSH_REHEARSE_API_KEY || '',
   });
-  const ctx = { ...ctxBase, get: (name) => (name === 'llm' ? llm : undefined) };
-  const logLines = [];
-  const model = createModelCalls({
-    ctx,
-    store: ctx.store,
-    cfg: { ...cfg, ...budgetCfg, ...checkCfg },
-    log: (line) => logLines.push(String(line)),
-    lint: {},
-  });
-  const rows = [];
-  for (const item of files) {
-    const before = { calls: llm.usage.calls, input: llm.usage.promptTokens, output: llm.usage.completionTokens, cacheRead: llm.usage.cacheReadTokens };
-    const logFrom = logLines.length;
+}
+
+/**
+ * 跑一个 arm：同一份文件列表，arm 内部按 concurrency 并发，文件之间互不影响。
+ *
+ * 共用同一份 store 是安全的：askModel 只读 store（memory_recall → recall 是纯读，
+ * 最多写 state 里的 tokenCache/dfCache 这类进程内缓存），没有写库事务，
+ * 所以不需要每文件一份副本库。日志按文件收集，避免并发时行串到别人身上。
+ */
+async function replayArm({ armName, files, cfg, ctxBase, budgetCfg, checkCfg, concurrency = 1 }) {
+  const rows = await mapLimit(files, concurrency, async (item) => {
+    const llm = makeLlm();
+    const ctx = { ...ctxBase, get: (name) => (name === 'llm' ? llm : undefined) };
+    const logLines = [];
+    const model = createModelCalls({
+      ctx,
+      store: ctx.store,
+      cfg: { ...cfg, ...budgetCfg, ...checkCfg },
+      log: (line) => logLines.push(String(line)),
+      lint: {},
+    });
     let raw = '';
     let error = '';
+    const t0 = Date.now();
     try {
       raw = await model.askModel(item.transcript, item.existing, cfg.reasoningEffort);
     } catch (e) {
       error = String(e?.message || e);
     }
-    const mine = logLines.slice(logFrom);
-    rows.push({
-      file: path.basename(item.file),
-      arm: armName,
-      calls: llm.usage.calls - before.calls,
-      input: llm.usage.promptTokens - before.input,
-      output: llm.usage.completionTokens - before.output,
-      cacheRead: llm.usage.cacheReadTokens - before.cacheRead,
-      toolCalls: mine.filter((line) => line.startsWith('整理时核对')).length,
-      compactions: mine.filter((line) => line.includes('[sleep] 工具上下文预算 轮=')).length,
-      guardStops: mine.filter((line) => line.includes('[agent-loop] 中断')).length,
-      error,
-      signature: actionSignature(raw),
-    });
-  }
+    return { ...rowOfArm({ armName, item, llm, raw, error, mine: logLines }), ms: Date.now() - t0 };
+  }, () => onArmProgress(armName, concurrency, files.length));
   return rows;
 }
 
-async function replay({ sessions, db, limit, since, baselineRepeats = 1 }) {
+/** 并发时进度不刷屏：每完成一个只打一行（calls / 耗时），收工再打汇总。 */
+function onArmProgress(armName, concurrency, total) {
+  if (concurrency <= 1) return;
+  armDone[armName] = (armDone[armName] || 0) + 1;
+  if (armDone[armName] % concurrency === 0 || armDone[armName] === total) {
+    console.log(`[${armName}] 已完成 ${armDone[armName]}/${total} 个文件`);
+  }
+}
+const armDone = {};
+
+async function replay({ sessions, db, limit, since, baselineRepeats = 1, concurrency = 1 }) {
   if (!sessions) throw new Error('--replay 必须给 --sessions');
   if (!db) throw new Error('--replay 必须给 --db（副本库）');
   if (path.resolve(db) === path.resolve(DEFAULT_DB_PATH)) {
@@ -321,20 +373,32 @@ async function replay({ sessions, db, limit, since, baselineRepeats = 1 }) {
   if (!picked.length) throw new Error('选中的会话文件都没有可回放的消息');
 
   const ctxBase = { store, logger: cfg.logger, provide() {}, effect() {}, tools: { get: () => null, register() {} } };
+  // 墙钟：每个 arm 从开到关单独计，串行版的耗时可拿来比
+  const startedAt = Date.now();
+  const armMs = {};
   // 基线跑多遍：模型自己就有非确定性，两遍基线的差异 = 噪音水位，用来判断预算臂的差异算不算「掉了」
+  // arm 与 arm 之间串行；arm 内部按 concurrency 并发（每个文件一个独立 llm，结果按下标对位）
   const baselines = [];
   for (let i = 0; i < Math.max(1, baselineRepeats); i += 1) {
+    const armName = i === 0 ? 'baseline' : `baseline${i + 1}`;
+    const t0 = Date.now();
     baselines.push(await replayArm({
-      armName: i === 0 ? 'baseline' : `baseline${i + 1}`, files: picked, cfg, ctxBase,
+      armName, files: picked, cfg, ctxBase,
       budgetCfg: { sleepToolBudget: { enabled: false }, sleepToolCheck: { enabled: false } },
       checkCfg: {},
+      concurrency,
     }));
+    armMs[armName] = Date.now() - t0;
   }
+  const budgetT0 = Date.now();
   const budgeted = await replayArm({
     armName: 'budget', files: picked, cfg, ctxBase,
     budgetCfg: {}, // 默认配置：预算开、定向查证开
     checkCfg: {},
+    concurrency,
   });
+  armMs.budget = Date.now() - budgetT0;
+  const wallMs = Date.now() - startedAt;
 
   const rows = picked.map((item, index) => {
     const b = baselines[0][index];
@@ -372,6 +436,9 @@ async function replay({ sessions, db, limit, since, baselineRepeats = 1 }) {
     sessions,
     db,
     files: rows.length,
+    concurrency,
+    wallMs,
+    armMs,
     totals: {
       baseline: { calls: sum('baseline', 'calls'), input: sum('baseline', 'input'), output: sum('baseline', 'output'), cacheRead: sum('baseline', 'cacheRead'), actions: sum('baseline', 'actions') },
       ...(rows[0] && rows[0].baseline2 ? { baseline2: { calls: sum('baseline2', 'calls'), input: sum('baseline2', 'input'), output: sum('baseline2', 'output'), cacheRead: sum('baseline2', 'cacheRead'), actions: sum('baseline2', 'actions') } } : {}),
@@ -383,7 +450,7 @@ async function replay({ sessions, db, limit, since, baselineRepeats = 1 }) {
     sameTextsBaseline2: rows.filter((r) => r.sameTextsBaseline2).length,
     rows,
     notes: [
-      '两个 arm 都是独立进程内的独立 llm 实例，输入/输出是按 [usage] 字段累计的真值。',
+      '每个文件用独立的 llm 实例、用量按文件自己累计（并发下不串）；arm 内按 --concurrency 并发，arm 之间串行。',
       '温度固定 0.3 仍有非确定性：结论差异按同一文件配对看，不能跨文件比；--baseline-repeats 2 给出噪音水位。',
       '结构口径 = add 条数 + update/merge/archive 的 id 集合；正文逐字比较只作参考。',
       '缓存读取取决于上游前缀缓存命中，回放数值与线上不同；费用要上线后另测。',
@@ -410,7 +477,7 @@ async function main() {
     for (const line of report.assumptions) console.log(`  - ${line}`);
     return 0;
   }
-  const report = await replay({ sessions: args.sessions || resolveSessionsRoot(), db: args.db || resolveDbPath(), limit: args.limit, since: args.since, baselineRepeats: args.baselineRepeats });
+  const report = await replay({ sessions: args.sessions || resolveSessionsRoot(), db: args.db || resolveDbPath(), limit: args.limit, since: args.since, baselineRepeats: args.baselineRepeats, concurrency: args.concurrency });
   if (args.out) fs.writeFileSync(args.out, JSON.stringify(report, null, 2));
   if (args.json) {
     console.log(JSON.stringify(report, null, 2));
@@ -427,6 +494,11 @@ async function main() {
   if (report.totals.baseline2) {
     console.log(`噪音水位（baseline vs baseline2，结构 / 正文）：${report.sameConclusionBaseline2}/${report.files} / ${report.sameTextsBaseline2}/${report.files}`);
   }
+  const min = (ms) => `${Math.round(ms / 600) / 100}min`;
+  const armLine = ['baseline', 'baseline2', 'budget']
+    .filter((a) => report.armMs && report.armMs[a] !== undefined)
+    .map((a) => `${a}=${min(report.armMs[a])}`).join(' ');
+  console.log(`并发 ${report.concurrency} 路；墙钟 ${min(report.wallMs)}（${armLine}）`);
   for (const line of report.notes) console.log(`  - ${line}`);
   return 0;
 }
